@@ -1,7 +1,7 @@
 """Generate 4 example graph HTML files for exploration."""
 
-from grapy.core import KnowledgeGraph
-from grapy.viz import visualize
+from kaybee.core import KnowledgeGraph
+from kaybee.viz import visualize
 
 
 def graph_1_cognitive_science():

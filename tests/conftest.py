@@ -2,7 +2,7 @@
 
 import pytest
 
-from grapy.core import KnowledgeGraph
+from kaybee.core import KnowledgeGraph
 
 
 @pytest.fixture

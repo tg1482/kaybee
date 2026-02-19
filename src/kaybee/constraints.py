@@ -4,7 +4,7 @@ A pluggable "compiler" that checks graph-level rules before publishing.
 
 Usage::
 
-    from grapy.constraints import Validator, requires_link, requires_field
+    from kaybee.constraints import Validator, requires_link, requires_field
 
     v = Validator()
     v.add(requires_link("paper", target_type="person"))

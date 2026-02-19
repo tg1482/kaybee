@@ -2,7 +2,7 @@
 
 import pytest
 
-from grapy.core import (
+from kaybee.core import (
     _parse_yaml_subset,
     extract_wikilinks,
     parse_frontmatter,

@@ -2,8 +2,8 @@
 
 import pytest
 
-from grapy.core import KnowledgeGraph
-from grapy.constraints import (
+from kaybee.core import KnowledgeGraph
+from kaybee.constraints import (
     ValidationError,
     Validator,
     Violation,

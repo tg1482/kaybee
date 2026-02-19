@@ -2,7 +2,7 @@
 
 import pytest
 
-from grapy.core import (
+from kaybee.core import (
     KnowledgeGraph,
     GRAPH_COMMANDS,
     register_graph_commands,

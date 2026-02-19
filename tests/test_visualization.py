@@ -5,8 +5,8 @@ import os
 
 import pytest
 
-from grapy.core import KnowledgeGraph
-from grapy.viz import build_viz_data, visualize
+from kaybee.core import KnowledgeGraph
+from kaybee.viz import build_viz_data, visualize
 
 
 # -----------------------------------------------------------------------

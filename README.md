@@ -1,17 +1,17 @@
-# grapy
+# kaybee
 
 A flat, SQLite-native knowledge graph with YAML frontmatter and wikilinks. Zero external dependencies.
 
 ## Install
 
 ```
-pip install grapy
+pip install kaybee
 ```
 
 ## Quick start
 
 ```python
-from grapy import KnowledgeGraph
+from kaybee import KnowledgeGraph
 
 kg = KnowledgeGraph()
 kg.add_type("concept")

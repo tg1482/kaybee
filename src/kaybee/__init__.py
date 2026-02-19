@@ -1,8 +1,8 @@
 """
-Grapy - A flat, SQLite-native knowledge graph with YAML frontmatter and wikilinks.
+Kaybee - A flat, SQLite-native knowledge graph with YAML frontmatter and wikilinks.
 
 Usage:
-    from grapy import KnowledgeGraph
+    from kaybee import KnowledgeGraph
 
     kg = KnowledgeGraph()
     kg.add_type("concept")

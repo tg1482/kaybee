@@ -6,8 +6,8 @@ search, tag filters, and animated edges.
 
 Usage::
 
-    from grapy.core import KnowledgeGraph
-    from grapy.viz import visualize
+    from kaybee.core import KnowledgeGraph
+    from kaybee.viz import visualize
 
     kg = KnowledgeGraph()
     # ... populate ...

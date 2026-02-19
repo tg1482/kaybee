@@ -2,7 +2,7 @@
 
 import pytest
 
-from grapy.core import KnowledgeGraph
+from kaybee.core import KnowledgeGraph
 
 
 class TestContentEdgeCases:
@@ -163,6 +163,6 @@ class TestReconstructRoundtrip:
         result = kg.cat("doc")
         assert "tags:" in result
         assert "Body." in result
-        from grapy.core import parse_frontmatter
+        from kaybee.core import parse_frontmatter
         meta, body = parse_frontmatter(result)
         assert meta["tags"] == ["a", "b", "c"]
