@@ -30,6 +30,7 @@ from kaybee.core import (
     _cmd_types,
     _cmd_tags,
     _cmd_help,
+    _cmd_read,
 )
 
 
@@ -305,6 +306,28 @@ class TestCmdHelp:
         assert "meta" in result
 
 
+class TestCmdRead:
+    def test_depth_zero(self, graph_kg):
+        result = _cmd_read(["sa"], "", graph_kg)
+        assert result == graph_kg.cat("sa")
+
+    def test_depth_flag(self, graph_kg):
+        result = _cmd_read(["sa", "-d", "1"], "", graph_kg)
+        assert "--- [[at]] ---" in result
+
+    def test_no_args_stdin_passthrough(self, graph_kg):
+        result = _cmd_read([], "piped content", graph_kg)
+        assert result == "piped content"
+
+    def test_no_args_no_stdin_raises(self, graph_kg):
+        with pytest.raises(ValueError):
+            _cmd_read([], "", graph_kg)
+
+    def test_nonexistent_raises(self, graph_kg):
+        with pytest.raises(KeyError):
+            _cmd_read(["nonexistent"], "", graph_kg)
+
+
 class TestRegister:
     def test_register_adds_all_commands(self):
         commands = {}
@@ -312,7 +335,7 @@ class TestRegister:
         expected = {"meta", "body", "links", "backlinks", "resolve", "schema", "query",
                      "ls", "cat", "touch", "write", "rm", "mv", "cp", "ln",
                      "tree", "find", "grep", "info", "sed", "help",
-                     "addtype", "rmtype", "types", "tags"}
+                     "addtype", "rmtype", "types", "tags", "read"}
         assert expected.issubset(set(commands.keys()))
 
     def test_removes_dir_commands(self):

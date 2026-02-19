@@ -175,3 +175,25 @@ def custom(
         return []
 
     return (type_name, _check)
+
+
+def freeze_schema(
+    type_name: str,
+    allowed_fields: list[str],
+) -> tuple[str | None, ConstraintFn]:
+    """Prevent nodes of *type_name* from having fields outside *allowed_fields*.
+
+    ``"type"`` is always implicitly allowed and does not need to be listed.
+    """
+    allowed = set(allowed_fields) | {"type"}
+
+    def _check(kg: KnowledgeGraph, name: str, meta: dict) -> list[Violation]:
+        extra = sorted(set(meta) - allowed)
+        if extra:
+            return [Violation(
+                name, "freeze_schema",
+                f"disallowed field(s): {', '.join(extra)}",
+            )]
+        return []
+
+    return (type_name, _check)

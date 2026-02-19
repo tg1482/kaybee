@@ -23,6 +23,7 @@ from .constraints import (
     requires_link,
     no_orphans,
     custom,
+    freeze_schema,
 )
 
 __version__ = "0.1.0"
@@ -44,4 +45,5 @@ __all__ = [
     "requires_link",
     "no_orphans",
     "custom",
+    "freeze_schema",
 ]

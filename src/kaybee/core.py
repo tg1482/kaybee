@@ -757,6 +757,57 @@ class KnowledgeGraph:
 
         return results
 
+    def read(self, name: str, depth: int = 0) -> str:
+        """Read a node with progressive disclosure of linked content.
+
+        - ``depth=0``: same as ``cat(name)``
+        - ``depth=1``: main content + content of direct wikilink targets
+        - ``depth=N``: recursive to N levels
+
+        Cycles are handled via a visited set. Linked nodes are sorted
+        alphabetically for deterministic output.
+        """
+        if depth <= 0:
+            return self.cat(name)
+
+        visited: set[str] = set()
+        sections: list[str] = []
+        self._read_recursive(name, depth, visited, sections, is_root=True)
+        return "\n".join(sections)
+
+    def _read_recursive(
+        self,
+        name: str,
+        depth: int,
+        visited: set[str],
+        sections: list[str],
+        is_root: bool = False,
+    ) -> None:
+        if name in visited:
+            return
+        visited.add(name)
+
+        content = self.cat(name)
+        if is_root:
+            sections.append(content)
+        else:
+            sections.append(f"--- [[{name}]] ---")
+            sections.append(content)
+
+        if depth <= 0:
+            return
+
+        # Get resolved link targets from _links table
+        rows = self._db.execute(
+            "SELECT target_resolved FROM _links WHERE source_name = ? AND target_resolved IS NOT NULL",
+            (name,),
+        ).fetchall()
+        targets = sorted(set(r[0] for r in rows))
+
+        for target in targets:
+            if target not in visited and self.exists(target):
+                self._read_recursive(target, depth - 1, visited, sections)
+
     def find_by_type(self, type_name: str) -> list[str]:
         rows = self._db.execute(
             "SELECT name FROM nodes WHERE type = ? ORDER BY name", (type_name,)
@@ -1126,6 +1177,29 @@ def _cmd_tags(args: list[str], _stdin: str, tree: Any) -> str:
     return "\n".join(out_lines)
 
 
+def _cmd_read(args: list[str], stdin: str, tree: Any) -> str:
+    depth = 0
+    name: str | None = None
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-d" and i + 1 < len(args):
+            depth = int(args[i + 1])
+            i += 2
+            continue
+        if name is None:
+            name = arg
+        i += 1
+
+    if name is None:
+        if stdin:
+            return stdin
+        raise ValueError("read requires a name")
+
+    return tree.read(name, depth=depth)
+
+
 def _cmd_help(_args: list[str], _stdin: str, _tree: Any) -> str:
     return """Available commands:
   ls [type|*]           List types or nodes of a type
@@ -1155,6 +1229,7 @@ def _cmd_help(_args: list[str], _stdin: str, _tree: Any) -> str:
   schema                Show all types and their fields
   query <sql>           Run SQL query
 
+  read <name> [-d depth]  Read node with linked content
   echo <text>           Print text
   printf <fmt> [args]   Print formatted text
   help                  Show this help
@@ -1192,6 +1267,7 @@ GRAPH_COMMANDS: dict[str, Any] = {
     "rmtype": _cmd_rmtype,
     "types": _cmd_types,
     "tags": _cmd_tags,
+    "read": _cmd_read,
 }
 
 GRAPH_HELP = """
@@ -1206,7 +1282,8 @@ Graph commands (KnowledgeGraph):
   addtype <type>           Register a type
   rmtype <type>            Unregister a type
   types                    List registered types
-  tags [name]              Show tags"""
+  tags [name]              Show tags
+  read <name> [-d depth]   Read node with linked content"""
 
 
 def register_graph_commands(commands: dict) -> None:

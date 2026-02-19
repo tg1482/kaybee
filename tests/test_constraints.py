@@ -8,6 +8,7 @@ from kaybee.constraints import (
     Validator,
     Violation,
     custom,
+    freeze_schema,
     no_orphans,
     requires_field,
     requires_link,
@@ -183,6 +184,59 @@ class TestValidationError:
         with pytest.raises(ValidationError) as exc_info:
             v.check(kg)
         assert len(exc_info.value.violations) == 2
+
+
+class TestFreezeSchema:
+    def test_passes_with_matching_fields(self, kg):
+        kg.write("c1", "---\ntype: concept\ndescription: OK\ntags: [x]\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", ["description", "tags"]))
+        assert v.validate(kg) == []
+
+    def test_passes_with_subset(self, kg):
+        kg.write("c1", "---\ntype: concept\ndescription: OK\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", ["description", "tags"]))
+        assert v.validate(kg) == []
+
+    def test_fails_on_extra_fields(self, kg):
+        kg.write("c1", "---\ntype: concept\ndescription: OK\nsecret: oops\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", ["description"]))
+        errors = v.validate(kg)
+        assert len(errors) == 1
+        assert errors[0].node == "c1"
+        assert errors[0].rule == "freeze_schema"
+        assert "secret" in errors[0].message
+
+    def test_type_field_always_allowed(self, kg):
+        kg.write("c1", "---\ntype: concept\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", []))
+        assert v.validate(kg) == []
+
+    def test_multiple_extra_fields(self, kg):
+        kg.write("c1", "---\ntype: concept\nalpha: 1\nbeta: 2\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", []))
+        errors = v.validate(kg)
+        assert len(errors) == 1
+        assert "alpha" in errors[0].message
+        assert "beta" in errors[0].message
+
+    def test_only_checks_target_type(self, kg):
+        kg.write("c1", "---\ntype: concept\nextra: bad\n---\nBody.")
+        kg.write("p1", "---\ntype: person\nextra: fine\n---\nBody.")
+        v = Validator().add(freeze_schema("concept", []))
+        errors = v.validate(kg)
+        assert len(errors) == 1
+        assert errors[0].node == "c1"
+
+    def test_composable_with_other_constraints(self, kg):
+        kg.write("c1", "---\ntype: concept\nextra: bad\n---\nBody.")
+        v = Validator()
+        v.add(freeze_schema("concept", ["description"]))
+        v.add(requires_field("concept", "description"))
+        errors = v.validate(kg)
+        assert len(errors) == 2
+        rules = {e.rule for e in errors}
+        assert "freeze_schema" in rules
+        assert "requires_field" in rules
 
 
 class TestComposition:
