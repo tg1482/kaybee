@@ -20,12 +20,6 @@ import sqlite3
 from typing import Any
 
 
-def _get_user_tables(kg) -> list[str]:
-    """Return names of user-created type tables (including 'kaybee')."""
-    rows = kg.query("SELECT DISTINCT type FROM nodes")
-    return list({r[0] for r in rows})
-
-
 def _local_table_columns(kg, table: str) -> list[str]:
     """Return column names for a local SQLite table via kg.query()."""
     rows = kg.query(f"PRAGMA table_info(`{table}`)")
@@ -178,52 +172,23 @@ def _delete_from_mysql(
 # ---------------------------------------------------------------------------
 
 def _sync_push_full(kg, mysql_conn, scope: dict) -> int:
-    """Push all local type tables to MySQL with scope injection.
+    """Push all local nodes to MySQL with scope injection.
 
-    Scans every row in every type table and upserts to MySQL.  Does not
-    propagate deletes — if a node was removed locally it simply won't be
-    pushed, but the stale row remains in MySQL.
+    Reads every node via the public API (mode-agnostic) and upserts to MySQL.
+    Does not propagate deletes — if a node was removed locally it simply won't
+    be pushed, but the stale row remains in MySQL.
 
     Returns 0 (no changelog position to track).
     """
-    scope_keys = list(scope.keys())
-    scope_vals = list(scope.values())
-    tables = _get_user_tables(kg)
     cursor = mysql_conn.cursor()
     cache: dict[str, set[str]] = {}
 
-    for table in tables:
-        cols = _local_table_columns(kg, table)
-        if not cols:
-            continue
-
-        uk = ["name"] + scope_keys
-        _ensure_mysql_table(cursor, table, cols, scope_keys, uk, _cache=cache)
-
-        rows = kg.query(f"SELECT * FROM `{table}`")
-        if not rows:
-            continue
-
-        all_cols = scope_keys + cols
-        placeholders = ", ".join(["%s"] * len(all_cols))
-        col_str = ", ".join(f"`{c}`" for c in all_cols)
-        update_parts = ", ".join(
-            f"`{c}` = VALUES(`{c}`)" for c in all_cols if c not in uk
-        )
-
-        for row in rows:
-            vals = scope_vals + list(row)
-            if update_parts:
-                cursor.execute(
-                    f"INSERT INTO `{table}` ({col_str}) VALUES ({placeholders}) "
-                    f"ON DUPLICATE KEY UPDATE {update_parts}",
-                    vals,
-                )
-            else:
-                cursor.execute(
-                    f"INSERT IGNORE INTO `{table}` ({col_str}) VALUES ({placeholders})",
-                    vals,
-                )
+    for name in kg.ls("*"):
+        nfo = kg.info(name)
+        type_name = nfo["type"] or "kaybee"
+        content = kg.body(name)
+        meta = kg.frontmatter(name)
+        _upsert_to_mysql(cursor, type_name, name, content, meta, scope, _cache=cache)
 
     mysql_conn.commit()
     cursor.close()
@@ -344,15 +309,15 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
     scope_keys = list(scope.keys())
     scope_vals = list(scope.values())
     cursor = mysql_conn.cursor()
-    tables = _get_mysql_tables(cursor, scope_keys)
+    mysql_tables = _get_mysql_tables(cursor, scope_keys)
     total = 0
 
-    for table in tables:
-        if not _mysql_table_exists(cursor, table):
+    for type_name in mysql_tables:
+        if not _mysql_table_exists(cursor, type_name):
             continue
 
         where = " AND ".join(f"`{k}` = %s" for k in scope_keys)
-        cursor.execute(f"SELECT * FROM `{table}` WHERE {where}", scope_vals)
+        cursor.execute(f"SELECT * FROM `{type_name}` WHERE {where}", scope_vals)
         mysql_cols = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
 
@@ -360,17 +325,29 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
         local_cols = [c for c in mysql_cols if c not in scope_keys]
         local_idxs = [mysql_cols.index(c) for c in local_cols]
 
+        # Route to the correct local table (handles multi/single)
+        local_table = kg.data_table(type_name)
+
         # Ensure local table exists and has all columns
-        existing_local = set(_local_table_columns(kg, table))
+        existing_local = set(_local_table_columns(kg, local_table))
         if not existing_local:
             col_defs = ", ".join(f"`{c}` TEXT" for c in local_cols)
-            kg.query(f"CREATE TABLE IF NOT EXISTS `{table}` ({col_defs})")
+            kg.query(f"CREATE TABLE IF NOT EXISTS `{local_table}` ({col_defs})")
             existing_local = set(local_cols)
         else:
             for col in local_cols:
                 if col not in existing_local:
                     safe_col = col.replace('"', '""')
-                    kg.query(f'ALTER TABLE `{table}` ADD COLUMN `{safe_col}` TEXT')
+                    kg.query(f'ALTER TABLE `{local_table}` ADD COLUMN `{safe_col}` TEXT')
+
+        # In single mode, register type-specific fields in _type_fields
+        if local_table == "_data" and type_name != "kaybee":
+            for col in local_cols:
+                if col not in ("name", "content"):
+                    kg.query(
+                        "INSERT OR IGNORE INTO _type_fields (type_name, field_name) VALUES (?, ?)",
+                        (type_name, col),
+                    )
 
         col_str = ", ".join(f"`{c}`" for c in local_cols)
         placeholders = ", ".join(["?"] * len(local_cols))
@@ -378,7 +355,7 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
         for row in rows:
             vals = tuple(row[i] for i in local_idxs)
             kg.query(
-                f"INSERT OR REPLACE INTO `{table}` ({col_str}) VALUES ({placeholders})",
+                f"INSERT OR REPLACE INTO `{local_table}` ({col_str}) VALUES ({placeholders})",
                 vals,
             )
             total += 1
@@ -393,7 +370,7 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
                 if not existing:
                     kg.query(
                         "INSERT OR IGNORE INTO nodes (name, type) VALUES (?, ?)",
-                        (name_val, table),
+                        (name_val, type_name),
                     )
 
     kg.commit()
