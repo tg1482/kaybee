@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from typing import Any
 
 
@@ -212,7 +213,7 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 # KnowledgeGraph
 # ---------------------------------------------------------------------------
 
-_RESERVED_TYPE_NAMES = frozenset({"nodes", "_types", "_links"})
+_RESERVED_TYPE_NAMES = frozenset({"nodes", "_types", "_links", "_changelog"})
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -249,16 +250,34 @@ class KnowledgeGraph:
     grouping mechanism — no directories, no paths.
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: str = ":memory:", changelog: bool = False) -> None:
         self._db = sqlite3.connect(db_path)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._validator = None
+        self._changelog = changelog
         self._init_schema()
 
     def _init_schema(self) -> None:
         self._db.executescript(_SCHEMA_SQL)
+        if self._changelog:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS _changelog ("
+                "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "ts REAL NOT NULL, "
+                "op TEXT NOT NULL, "
+                "name TEXT NOT NULL, "
+                "data TEXT)"
+            )
         self._db.commit()
+
+    def _log(self, op: str, name: str, data: dict | None = None) -> None:
+        if not self._changelog:
+            return
+        self._db.execute(
+            "INSERT INTO _changelog (ts, op, name, data) VALUES (?, ?, ?, ?)",
+            (time.time(), op, name, json.dumps(data) if data else None),
+        )
 
     # ------------------------------------------------------------------
     # Internal: type-table management
@@ -474,6 +493,7 @@ class KnowledgeGraph:
 
         self._sync_links(name, body)
         self._re_resolve_links_to(name)
+        self._log("node.write", name, {"type": effective_type, "content": body, "meta": meta})
         self._db.commit()
 
     # ------------------------------------------------------------------
@@ -483,6 +503,7 @@ class KnowledgeGraph:
     def add_type(self, type_name: str) -> "KnowledgeGraph":
         """Register a type (idempotent)."""
         self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (type_name,))
+        self._log("type.add", type_name)
         self._db.commit()
         return self
 
@@ -494,6 +515,7 @@ class KnowledgeGraph:
         if count > 0:
             raise ValueError(f"Cannot remove type '{type_name}': {count} node(s) still exist")
         self._db.execute("DELETE FROM _types WHERE type_name = ?", (type_name,))
+        self._log("type.rm", type_name)
         self._db.commit()
         return self
 
@@ -501,6 +523,34 @@ class KnowledgeGraph:
         """Return sorted list of registered types."""
         rows = self._db.execute("SELECT type_name FROM _types ORDER BY type_name").fetchall()
         return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------
+    # Changelog
+    # ------------------------------------------------------------------
+
+    def changelog(self, since_seq: int = 0, limit: int = 100) -> list[tuple]:
+        """Read changelog entries as (seq, ts, op, name, data) tuples.
+
+        Returns entries with seq > since_seq, up to *limit* rows.
+        """
+        if not self._changelog:
+            return []
+        rows = self._db.execute(
+            "SELECT seq, ts, op, name, data FROM _changelog "
+            "WHERE seq > ? ORDER BY seq LIMIT ?",
+            (since_seq, limit),
+        ).fetchall()
+        return rows
+
+    def changelog_truncate(self, before_seq: int) -> int:
+        """Delete changelog entries with seq < before_seq. Returns rows deleted."""
+        if not self._changelog:
+            return 0
+        cur = self._db.execute(
+            "DELETE FROM _changelog WHERE seq < ?", (before_seq,)
+        )
+        self._db.commit()
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # CRUD
@@ -524,6 +574,7 @@ class KnowledgeGraph:
                 "INSERT OR IGNORE INTO kaybee (name, content) VALUES (?, '')",
                 (name,),
             )
+            self._log("node.write", name, {"type": "kaybee", "content": "", "meta": {}})
             self._db.commit()
         return self
 
@@ -569,11 +620,13 @@ class KnowledgeGraph:
         if row and row[0]:
             self._delete_from_type_table(row[0], name)
 
+        type_name = row[0] if row else "kaybee"
         self._db.execute("DELETE FROM _links WHERE source_name = ?", (name,))
         self._db.execute(
             "UPDATE _links SET target_resolved = NULL WHERE target_resolved = ?", (name,)
         )
         self._db.execute("DELETE FROM nodes WHERE name = ?", (name,))
+        self._log("node.rm", name, {"type": type_name})
         self._db.commit()
         return self
 
@@ -615,6 +668,7 @@ class KnowledgeGraph:
             "UPDATE _links SET target_resolved = ? WHERE target_resolved = ?", (new_name, old_name)
         )
 
+        self._log("node.mv", new_name, {"old_name": old_name, "type": type_name, "content": content, "meta": meta})
         self._db.commit()
         return self
 
@@ -642,6 +696,7 @@ class KnowledgeGraph:
         self._upsert_type_row(type_name, dst, content, meta)
 
         self._sync_links(dst, content)
+        self._log("node.cp", dst, {"source": src, "type": type_name, "content": content, "meta": meta})
         self._db.commit()
         return self
 
