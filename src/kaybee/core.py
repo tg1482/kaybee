@@ -1031,6 +1031,15 @@ class KnowledgeGraph:
             adj.setdefault(src, []).append(tgt)
         return adj
 
+    @property
+    def changelog_enabled(self) -> bool:
+        """Whether changelog recording is active."""
+        return self._changelog
+
+    def commit(self) -> None:
+        """Commit pending database changes."""
+        self._db.commit()
+
     def query(self, sql: str, params: tuple = ()) -> list[tuple]:
         return self._db.execute(sql, params).fetchall()
 

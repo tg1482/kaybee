@@ -8,6 +8,9 @@ Locally: slug is identity, unique per table.
 Globally: slug + scope (team_id, user_id, etc.) is identity.
 Push: replay changelog entries (or scan tables), inject scope, upsert/delete in MySQL.
 Pull: filter MySQL by scope, strip scope, write to local SQLite.
+
+All access to KnowledgeGraph internals goes through the public API:
+``kg.query()``, ``kg.commit()``, ``kg.changelog()``, ``kg.changelog_enabled``.
 """
 
 from __future__ import annotations
@@ -19,15 +22,13 @@ from typing import Any
 
 def _get_user_tables(kg) -> list[str]:
     """Return names of user-created type tables (including 'kaybee')."""
-    rows = kg._db.execute(
-        "SELECT DISTINCT type FROM nodes"
-    ).fetchall()
+    rows = kg.query("SELECT DISTINCT type FROM nodes")
     return list({r[0] for r in rows})
 
 
-def _table_columns(db, table: str) -> list[str]:
-    """Return column names for a table."""
-    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+def _local_table_columns(kg, table: str) -> list[str]:
+    """Return column names for a local SQLite table via kg.query()."""
+    rows = kg.query(f"PRAGMA table_info(`{table}`)")
     return [r[1] for r in rows]
 
 
@@ -192,14 +193,14 @@ def _sync_push_full(kg, mysql_conn, scope: dict) -> int:
     cache: dict[str, set[str]] = {}
 
     for table in tables:
-        cols = _table_columns(kg._db, table)
+        cols = _local_table_columns(kg, table)
         if not cols:
             continue
 
         uk = ["name"] + scope_keys
         _ensure_mysql_table(cursor, table, cols, scope_keys, uk, _cache=cache)
 
-        rows = kg._db.execute(f"SELECT * FROM `{table}`").fetchall()
+        rows = kg.query(f"SELECT * FROM `{table}`")
         if not rows:
             continue
 
@@ -256,7 +257,7 @@ def sync_push(kg, mysql_conn, scope: dict, *, since_seq: int = 0) -> int:
         Returns since_seq unchanged if there are no new entries.
         Returns 0 when changelog is disabled (no position to track).
     """
-    if not kg._changelog:
+    if not kg.changelog_enabled:
         return _sync_push_full(kg, mysql_conn, scope)
 
     cursor = mysql_conn.cursor()
@@ -328,8 +329,9 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
     """Pull rows matching scope from MySQL into local kaybee.
 
     This is a full pull — all rows matching scope are fetched and written
-    directly to the local SQLite database.  Writes go to kg._db directly
-    so they do NOT generate changelog entries (no push-back loop).
+    to the local SQLite database via ``kg.query()`` (raw SQL).  These writes
+    bypass ``kg.write()`` intentionally so they do NOT generate changelog
+    entries (no push-back loop).
 
     Args:
         kg: A KnowledgeGraph instance.
@@ -359,24 +361,23 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
         local_idxs = [mysql_cols.index(c) for c in local_cols]
 
         # Ensure local table exists and has all columns
-        existing_local = set(_table_columns(kg._db, table))
+        existing_local = set(_local_table_columns(kg, table))
         if not existing_local:
-            # Table doesn't exist locally — create it
             col_defs = ", ".join(f"`{c}` TEXT" for c in local_cols)
-            kg._db.execute(f"CREATE TABLE IF NOT EXISTS `{table}` ({col_defs})")
+            kg.query(f"CREATE TABLE IF NOT EXISTS `{table}` ({col_defs})")
             existing_local = set(local_cols)
         else:
             for col in local_cols:
                 if col not in existing_local:
                     safe_col = col.replace('"', '""')
-                    kg._db.execute(f'ALTER TABLE `{table}` ADD COLUMN `{safe_col}` TEXT')
+                    kg.query(f'ALTER TABLE `{table}` ADD COLUMN `{safe_col}` TEXT')
 
         col_str = ", ".join(f"`{c}`" for c in local_cols)
         placeholders = ", ".join(["?"] * len(local_cols))
 
         for row in rows:
-            vals = [row[i] for i in local_idxs]
-            kg._db.execute(
+            vals = tuple(row[i] for i in local_idxs)
+            kg.query(
                 f"INSERT OR REPLACE INTO `{table}` ({col_str}) VALUES ({placeholders})",
                 vals,
             )
@@ -384,19 +385,17 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
 
         # Also ensure nodes index is updated for pulled rows
         if "name" in local_cols:
-            name_idx = local_cols.index("name")
             for row in rows:
                 name_val = row[mysql_cols.index("name")]
-                # Check if already in nodes
-                existing = kg._db.execute(
+                existing = kg.query(
                     "SELECT 1 FROM nodes WHERE name = ?", (name_val,)
-                ).fetchone()
+                )
                 if not existing:
-                    kg._db.execute(
+                    kg.query(
                         "INSERT OR IGNORE INTO nodes (name, type) VALUES (?, ?)",
                         (name_val, table),
                     )
 
-    kg._db.commit()
+    kg.commit()
     cursor.close()
     return total
