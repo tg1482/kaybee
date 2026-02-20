@@ -268,3 +268,90 @@ class TestComposition:
         assert len(errors) == 1
         assert errors[0].node == "p1"
         assert "role" in errors[0].message
+
+
+class TestGatekeeper:
+    """Test pre-write validator gatekeeper mode."""
+
+    def test_structural_blocks_invalid_write(self, kg):
+        """Structural constraint blocks invalid write, node doesn't persist."""
+        v = Validator()
+        v.add(requires_field("concept", "description"))
+        kg.set_validator(v)
+
+        with pytest.raises(ValidationError):
+            kg.write("bad", "---\ntype: concept\n---\nNo description.")
+
+        assert not kg.exists("bad")
+
+    def test_valid_write_succeeds_with_validator(self, kg):
+        """Valid write succeeds when validator is attached."""
+        v = Validator()
+        v.add(requires_field("concept", "description"))
+        kg.set_validator(v)
+
+        kg.write("good", "---\ntype: concept\ndescription: OK\n---\nBody.")
+        assert kg.exists("good")
+        assert kg.frontmatter("good")["description"] == "OK"
+
+    def test_relational_not_checked_pre_write(self, kg):
+        """Relational constraints (structural=False) NOT checked pre-write."""
+        v = Validator()
+        v.add(requires_link("concept"))  # structural=False
+        kg.set_validator(v)
+
+        # This should succeed even without links — relational rules aren't gatekeeper rules
+        kg.write("island", "---\ntype: concept\n---\nNo links.")
+        assert kg.exists("island")
+
+    def test_clear_validator_restores_freeform(self, kg):
+        """clear_validator restores freeform mode."""
+        v = Validator()
+        v.add(requires_field("concept", "description"))
+        kg.set_validator(v)
+
+        with pytest.raises(ValidationError):
+            kg.write("bad", "---\ntype: concept\n---\nNo description.")
+
+        kg.clear_validator()
+
+        # Now the same write should succeed
+        kg.write("bad", "---\ntype: concept\n---\nNo description.")
+        assert kg.exists("bad")
+
+    def test_no_validator_unconstrained(self, kg):
+        """Without validator, writes are unconstrained."""
+        kg.write("anything", "---\ntype: concept\n---\nNo description, no tags.")
+        assert kg.exists("anything")
+
+    def test_freeze_schema_gatekeeper(self, kg):
+        """freeze_schema (structural=True) blocks extra fields pre-write."""
+        v = Validator()
+        v.add(freeze_schema("concept", ["description"]))
+        kg.set_validator(v)
+
+        with pytest.raises(ValidationError):
+            kg.write("bad", "---\ntype: concept\nsecret: oops\n---\nBody.")
+        assert not kg.exists("bad")
+
+        kg.write("good", "---\ntype: concept\ndescription: OK\n---\nBody.")
+        assert kg.exists("good")
+
+    def test_requires_tag_gatekeeper(self, kg):
+        """requires_tag (structural=True) blocks tagless writes pre-write."""
+        v = Validator()
+        v.add(requires_tag("concept"))
+        kg.set_validator(v)
+
+        with pytest.raises(ValidationError):
+            kg.write("bad", "---\ntype: concept\n---\nNo tags.")
+        assert not kg.exists("bad")
+
+    def test_set_validator_returns_self(self, kg):
+        v = Validator()
+        result = kg.set_validator(v)
+        assert result is kg
+
+    def test_clear_validator_returns_self(self, kg):
+        result = kg.clear_validator()
+        assert result is kg

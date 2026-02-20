@@ -48,16 +48,29 @@ class ValidationError(Exception):
 # Takes (kg, node_name, meta_dict) -> list of Violations (empty = pass).
 ConstraintFn = Callable[["KnowledgeGraph", str, dict], list[Violation]]
 
+# A rule is a 3-tuple: (type_filter, check_fn, structural).
+# structural=True means the rule can be checked pre-write (no DB needed).
+# For backward compat, 2-tuples are accepted (defaults structural=False).
+RuleTuple = tuple[str | None, ConstraintFn, bool]
+
 
 class Validator:
     """Collects constraints and validates a KnowledgeGraph against them."""
 
     def __init__(self) -> None:
-        self._rules: list[tuple[str | None, ConstraintFn]] = []
+        self._rules: list[RuleTuple] = []
 
-    def add(self, rule: tuple[str | None, ConstraintFn]) -> "Validator":
-        """Add a constraint rule. Returns self for chaining."""
-        self._rules.append(rule)
+    def add(self, rule: tuple[str | None, ConstraintFn] | RuleTuple) -> "Validator":
+        """Add a constraint rule. Returns self for chaining.
+
+        Accepts 2-tuple ``(type_filter, check_fn)`` (backward compat,
+        defaults ``structural=False``) or 3-tuple
+        ``(type_filter, check_fn, structural)``.
+        """
+        if len(rule) == 2:
+            self._rules.append((rule[0], rule[1], False))
+        else:
+            self._rules.append(rule)  # type: ignore[arg-type]
         return self
 
     def validate(self, kg: KnowledgeGraph) -> list[Violation]:
@@ -65,7 +78,7 @@ class Validator:
         violations: list[Violation] = []
         all_nodes = kg.ls("*")
 
-        for type_filter, check_fn in self._rules:
+        for type_filter, check_fn, _structural in self._rules:
             if type_filter is None:
                 names = all_nodes
             else:
@@ -83,13 +96,32 @@ class Validator:
         if violations:
             raise ValidationError(violations)
 
+    def validate_structural(self, name: str, meta: dict) -> list[Violation]:
+        """Run only structural rules against a proposed write.
+
+        This is used by the gatekeeper to block invalid writes before they
+        persist. Does NOT require a KnowledgeGraph instance for checking —
+        uses ``None`` as the kg parameter since structural rules only
+        inspect name/meta.
+        """
+        violations: list[Violation] = []
+        for type_filter, check_fn, structural in self._rules:
+            if not structural:
+                continue
+            # Check type filter against the proposed meta
+            proposed_type = meta.get("type")
+            if type_filter is not None and proposed_type != type_filter:
+                continue
+            violations.extend(check_fn(None, name, meta))  # type: ignore[arg-type]
+        return violations
+
 
 # ---------------------------------------------------------------------------
 # Built-in constraint factories
 # ---------------------------------------------------------------------------
 
 
-def requires_field(type_name: str | None, field: str) -> tuple[str | None, ConstraintFn]:
+def requires_field(type_name: str | None, field: str) -> RuleTuple:
     """Every node (of type) must have ``field`` in frontmatter."""
 
     def _check(kg: KnowledgeGraph, name: str, meta: dict) -> list[Violation]:
@@ -97,10 +129,10 @@ def requires_field(type_name: str | None, field: str) -> tuple[str | None, Const
             return [Violation(name, "requires_field", f"missing field '{field}'")]
         return []
 
-    return (type_name, _check)
+    return (type_name, _check, True)
 
 
-def requires_tag(type_name: str | None) -> tuple[str | None, ConstraintFn]:
+def requires_tag(type_name: str | None) -> RuleTuple:
     """Every node (of type) must have at least one tag."""
 
     def _check(kg: KnowledgeGraph, name: str, meta: dict) -> list[Violation]:
@@ -109,13 +141,13 @@ def requires_tag(type_name: str | None) -> tuple[str | None, ConstraintFn]:
             return [Violation(name, "requires_tag", "must have at least one tag")]
         return []
 
-    return (type_name, _check)
+    return (type_name, _check, True)
 
 
 def requires_link(
     type_name: str | None,
     target_type: str | None = None,
-) -> tuple[str | None, ConstraintFn]:
+) -> RuleTuple:
     """Every node (of type) must have at least one outgoing wikilink.
 
     If ``target_type`` is given, at least one link must point to a node of
@@ -144,10 +176,10 @@ def requires_link(
 
         return []
 
-    return (type_name, _check)
+    return (type_name, _check, False)
 
 
-def no_orphans(type_name: str | None = None) -> tuple[str | None, ConstraintFn]:
+def no_orphans(type_name: str | None = None) -> RuleTuple:
     """Every node (of type) must have at least one link in or out."""
 
     def _check(kg: KnowledgeGraph, name: str, meta: dict) -> list[Violation]:
@@ -155,14 +187,15 @@ def no_orphans(type_name: str | None = None) -> tuple[str | None, ConstraintFn]:
             return []
         return [Violation(name, "no_orphans", "node has no incoming or outgoing links")]
 
-    return (type_name, _check)
+    return (type_name, _check, False)
 
 
 def custom(
     type_name: str | None,
     rule_name: str,
     fn: Callable[["KnowledgeGraph", str, dict], str | None],
-) -> tuple[str | None, ConstraintFn]:
+    structural: bool = False,
+) -> RuleTuple:
     """Create a constraint from an arbitrary function.
 
     ``fn(kg, name, meta)`` should return an error message string, or None if valid.
@@ -174,13 +207,13 @@ def custom(
             return [Violation(name, rule_name, result)]
         return []
 
-    return (type_name, _check)
+    return (type_name, _check, structural)
 
 
 def freeze_schema(
     type_name: str,
     allowed_fields: list[str],
-) -> tuple[str | None, ConstraintFn]:
+) -> RuleTuple:
     """Prevent nodes of *type_name* from having fields outside *allowed_fields*.
 
     ``"type"`` is always implicitly allowed and does not need to be listed.
@@ -196,4 +229,4 @@ def freeze_schema(
             )]
         return []
 
-    return (type_name, _check)
+    return (type_name, _check, True)

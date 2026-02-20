@@ -998,8 +998,8 @@ def build_viz_data(kg: KnowledgeGraph) -> dict:
     Returns a dict with keys: ``nodes``, ``wikilink_edges``, ``types``, ``all_tags``.
     Each node includes description, content preview, metadata, outgoing and incoming links.
     """
-    rows = kg._db.execute(
-        "SELECT name, content, type, meta FROM nodes ORDER BY name"
+    index_rows = kg._db.execute(
+        "SELECT name, type FROM nodes ORDER BY name"
     ).fetchall()
 
     # Build backlink map
@@ -1013,8 +1013,12 @@ def build_viz_data(kg: KnowledgeGraph) -> dict:
         backlink_map.setdefault(tgt, []).append(src)
 
     nodes = []
-    for name, content, typ, meta_json in rows:
-        meta = json.loads(meta_json) if meta_json else {}
+    for name, type_name in index_rows:
+        try:
+            content, meta = kg._read_node_data(name)
+        except KeyError:
+            content, meta = "", {}
+        display_type = kg._display_type(type_name)
         node_tags = meta.get("tags", [])
         if not isinstance(node_tags, list):
             node_tags = []
@@ -1024,7 +1028,7 @@ def build_viz_data(kg: KnowledgeGraph) -> dict:
         nodes.append({
             "id": name,
             "label": name,
-            "type": typ,
+            "type": display_type,
             "tags": node_tags,
             "description": description,
             "content": content_preview,

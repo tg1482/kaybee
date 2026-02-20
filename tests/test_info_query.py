@@ -46,13 +46,13 @@ class TestInfo:
 class TestQuery:
     def test_basic(self, kg):
         kg.touch("file", "hello")
-        rows = kg.query("SELECT name, content FROM nodes WHERE name = 'file'")
+        rows = kg.query("SELECT name, content FROM kaybee WHERE name = 'file'")
         assert rows == [("file", "hello")]
 
     def test_with_params(self, kg):
         kg.touch("a", "x")
         kg.touch("b", "y")
-        rows = kg.query("SELECT name FROM nodes WHERE content = ?", ("x",))
+        rows = kg.query("SELECT name FROM kaybee WHERE content = ?", ("x",))
         assert rows == [("a",)]
 
     def test_empty_result(self, kg):

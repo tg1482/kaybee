@@ -99,7 +99,7 @@ class TestCrossGraphIsolation:
     def test_query_isolated(self, kg_pair):
         a, b = kg_pair
         a.touch("private", "secret data")
-        rows = b.query("SELECT * FROM nodes")
+        rows = b.query("SELECT name FROM nodes")
         names = [r[0] for r in rows]
         assert "private" not in names
 
@@ -188,15 +188,9 @@ class TestReservedNames:
         assert kg.exists("sqlite_master")
 
     def test_type_named_nodes(self, kg):
-        # BUG: type "nodes" collides with the real nodes table.
-        # _upsert_type_row does INSERT OR REPLACE INTO nodes (name, content)
-        # which clobbers the meta and type columns set by _write_node.
-        # This is a known limitation — type names that match internal tables break.
-        kg.write("item", "---\ntype: nodes\n---\nbody")
-        assert kg.exists("item")
-        # The type column gets clobbered to NULL by the type-table upsert
-        rows = kg.query("SELECT type FROM nodes WHERE name = 'item'")
-        assert rows[0][0] is None  # clobbered!
+        # Reserved type name "nodes" is now rejected with ValueError
+        with pytest.raises(ValueError, match="Reserved type name"):
+            kg.write("item", "---\ntype: nodes\n---\nbody")
 
     def test_type_named_select(self, kg):
         # SQL keyword as type name — _safe_ident keeps it as "SELECT"
@@ -909,7 +903,7 @@ class TestQueryAbuse:
 
     def test_query_with_params(self, kg):
         kg.touch("target", "data")
-        rows = kg.query("SELECT content FROM nodes WHERE name = ?", ("target",))
+        rows = kg.query("SELECT content FROM kaybee WHERE name = ?", ("target",))
         assert rows[0][0] == "data"
 
     def test_query_returns_link_info(self, kg):
