@@ -12,6 +12,7 @@ Usage:
 """
 
 from .core import KnowledgeGraph, extract_wikilinks, parse_frontmatter, slugify
+from .sync import sync_push, sync_pull
 from .shell import GraphShell, register_graph_commands, GRAPH_COMMANDS, GRAPH_HELP
 from .viz import build_viz_data, visualize
 from .constraints import (
@@ -47,4 +48,6 @@ __all__ = [
     "no_orphans",
     "custom",
     "freeze_schema",
+    "sync_push",
+    "sync_pull",
 ]
