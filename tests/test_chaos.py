@@ -697,60 +697,6 @@ class TestTagsChaos:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 11. Symlinks (ln)
-# ══════════════════════════════════════════════════════════════════════════
-
-
-class TestSymlinkChaos:
-    """Adversarial symlink usage."""
-
-    def test_ln_to_nonexistent(self, kg):
-        """Create a symlink to a target that doesn't exist."""
-        kg.ln("ghost", "link-to-ghost")
-        assert kg.exists("link-to-ghost")
-        meta = kg.frontmatter("link-to-ghost")
-        assert meta["link_target"] == "ghost"
-
-    def test_symlink_chain(self, kg):
-        """a -> b -> c (symlinks don't auto-follow, so each is independent)."""
-        kg.touch("real", "actual content")
-        kg.ln("real", "link1")
-        kg.ln("link1", "link2")
-        assert kg.exists("link1")
-        assert kg.exists("link2")
-        # link2 points to link1, not real
-        meta = kg.frontmatter("link2")
-        assert meta["link_target"] == "link1"
-
-    def test_circular_symlink(self, kg):
-        """a links to b, b links to a — should not crash."""
-        kg.touch("a", "content-a")
-        kg.ln("a", "b")
-        # Can't create a link named "a" because it already exists
-        assert kg.exists("a")
-        assert kg.exists("b")
-
-    def test_ln_to_existing_raises(self, kg):
-        kg.touch("target", "exists")
-        kg.touch("dest", "also exists")
-        with pytest.raises(FileExistsError):
-            kg.ln("target", "dest")
-
-    def test_backlinks_include_symlinks(self, kg):
-        kg.touch("target", "real content")
-        kg.ln("target", "sym-link")
-        bl = kg.backlinks("target")
-        assert "sym-link" in bl
-
-    def test_rm_symlink_does_not_affect_target(self, kg):
-        kg.touch("target", "real")
-        kg.ln("target", "sym")
-        kg.rm("sym")
-        assert kg.exists("target")
-        assert not kg.exists("sym")
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # 12. Massive / stress tests
 # ══════════════════════════════════════════════════════════════════════════
 

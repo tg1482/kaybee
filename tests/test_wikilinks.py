@@ -96,12 +96,6 @@ class TestBacklinks:
         assert "b" in kg.backlinks("a")
         assert "a" in kg.backlinks("b")
 
-    def test_symlink_backlinks(self, kg):
-        kg.touch("target", "data")
-        kg.ln("target", "link")
-        bl = kg.backlinks("target")
-        assert "link" in bl
-
     def test_no_backlinks(self, kg):
         kg.touch("isolated", "no links to me")
         assert kg.backlinks("isolated") == []

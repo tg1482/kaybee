@@ -43,3 +43,7 @@ dev-dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not stress'"
+markers = [
+    "stress: long-running stress/performance tests excluded from default runs",
+]

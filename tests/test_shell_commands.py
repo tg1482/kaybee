@@ -2,8 +2,8 @@
 
 import pytest
 
-from kaybee.core import (
-    KnowledgeGraph,
+from kaybee.core import KnowledgeGraph
+from kaybee.shell import (
     GRAPH_COMMANDS,
     register_graph_commands,
     _cmd_meta,
@@ -20,7 +20,6 @@ from kaybee.core import (
     _cmd_rm,
     _cmd_mv,
     _cmd_cp,
-    _cmd_ln,
     _cmd_tree,
     _cmd_find,
     _cmd_grep,
@@ -215,14 +214,6 @@ class TestCmdMvCp:
         assert kg.exists("b")
 
 
-class TestCmdLn:
-    def test_basic(self):
-        kg = KnowledgeGraph()
-        kg.touch("target", "data")
-        _cmd_ln(["target", "link"], "", kg)
-        assert kg.exists("link")
-
-
 class TestCmdTree:
     def test_basic(self, graph_kg):
         result = _cmd_tree([], "", graph_kg)
@@ -333,7 +324,7 @@ class TestRegister:
         commands = {}
         register_graph_commands(commands)
         expected = {"meta", "body", "links", "backlinks", "resolve", "schema", "query",
-                     "ls", "cat", "touch", "write", "rm", "mv", "cp", "ln",
+                     "ls", "cat", "touch", "write", "rm", "mv", "cp",
                      "tree", "find", "grep", "info", "sed", "help",
                      "addtype", "rmtype", "types", "tags", "read"}
         assert expected.issubset(set(commands.keys()))
@@ -347,5 +338,3 @@ class TestRegister:
         assert "du" not in commands
         assert "readlink" not in commands
         assert "ls" in commands  # overridden, not removed
-
-

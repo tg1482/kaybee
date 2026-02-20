@@ -13,6 +13,8 @@ import pytest
 from kaybee.core import KnowledgeGraph
 from kaybee.constraints import Validator, ValidationError, requires_field, requires_tag, freeze_schema
 
+pytestmark = pytest.mark.stress
+
 
 # ---------------------------------------------------------------------------
 # Helpers

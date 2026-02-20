@@ -98,31 +98,23 @@ visualize(kg, path="graph.html")
 
 ### MCP server
 
-kaybee ships as a [Loopy](https://github.com/tg1482/loopy) MCP tool:
-
-```json
-{
-  "mcpServers": {
-    "kaybee": {
-      "command": "uvx",
-      "args": ["--from", "loopy", "loopy-mcp"]
-    }
-  }
-}
-```
+MCP server support is not implemented in this repository yet.
 
 ### Shell commands
 
 ```python
-from kaybee import KnowledgeGraph, GRAPH_COMMANDS
+from kaybee import GraphShell, KnowledgeGraph
 
 kg = KnowledgeGraph()
-run = lambda cmd, args=[], stdin="": GRAPH_COMMANDS[cmd](args, stdin, kg)
+sh = GraphShell(kg)
 
-run("touch", ["neuron", "---\ntype: concept\n---\nA unit of [[computation]]."])
-run("ls", ["concept"])     # "neuron"
-run("links", ["neuron"])   # "[[computation]] -> (unresolved)"
-run("schema")              # "concept: (no fields)"
+sh.run("touch", ["neuron", "---\ntype: concept\n---\nA unit of [[computation]]."])
+sh.run("ls", ["concept"])     # "neuron"
+sh.run("links", ["neuron"])   # "[[computation]] -> (unresolved)"
+sh.run("schema")              # "concept: (no fields)"
+
+# Includes simple command-line chaining and pipes
+sh.execute("cat neuron | grep computation && echo done")
 ```
 
 ## API
@@ -134,7 +126,6 @@ run("schema")              # "concept: (no fields)"
 | `cat(name)` / `body(name)` / `frontmatter(name)` | Read content, body, or metadata |
 | `read(name, depth=0)` | Read node + linked content to N hops |
 | `rm(name)` / `mv(old, new)` / `cp(src, dst)` | Delete, rename, copy |
-| `ln(source, dest)` | Symlink |
 | `ls(type)` / `find(name, type)` / `grep(pattern)` | Search |
 | `tree()` | Type-grouped view |
 | `wikilinks(name)` / `backlinks(name)` | Link traversal |
@@ -142,6 +133,7 @@ run("schema")              # "concept: (no fields)"
 | `tags(name)` / `schema()` / `info(name)` | Metadata |
 | `query(sql, params)` | Raw SQL |
 | `add_type(name)` / `remove_type(name)` / `types()` | Type registry |
+| `GraphShell(graph)` | Shell/REPL command adapter |
 | `visualize(kg, path)` | Interactive HTML graph |
 | `freeze_schema(type, fields)` | Lock allowed frontmatter fields |
 

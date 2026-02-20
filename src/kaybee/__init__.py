@@ -12,7 +12,7 @@ Usage:
 """
 
 from .core import KnowledgeGraph, extract_wikilinks, parse_frontmatter, slugify
-from .core import register_graph_commands, GRAPH_COMMANDS, GRAPH_HELP
+from .shell import GraphShell, register_graph_commands, GRAPH_COMMANDS, GRAPH_HELP
 from .viz import build_viz_data, visualize
 from .constraints import (
     Validator,
@@ -32,6 +32,7 @@ __all__ = [
     "extract_wikilinks",
     "parse_frontmatter",
     "slugify",
+    "GraphShell",
     "register_graph_commands",
     "GRAPH_COMMANDS",
     "GRAPH_HELP",
