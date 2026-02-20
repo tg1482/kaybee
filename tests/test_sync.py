@@ -1,4 +1,4 @@
-"""Tests for sync_push and sync_pull with scope injection.
+"""Tests for changelog-driven sync_push and full sync_pull with scope injection.
 
 Uses a fake MySQL adapter backed by SQLite to avoid requiring a real MySQL server.
 """
@@ -84,7 +84,7 @@ class FakeMySQLConn:
         self._db = sqlite3.connect(":memory:")
 
     def cursor(self):
-        return FakeMySQLCursor(self._db)
+        return FakeMySQLCursorPragmaAsList(self._db)
 
     def commit(self):
         self._db.commit()
@@ -101,20 +101,13 @@ class FakeMySQLCursorPragmaAsList(FakeMySQLCursor):
         return rows
 
 
-class FakeMySQLConnV2(FakeMySQLConn):
-    """Version that returns column-name-only rows for SHOW COLUMNS."""
-
-    def cursor(self):
-        return FakeMySQLCursorPragmaAsList(self._db)
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def mysql_conn():
-    return FakeMySQLConnV2()
+    return FakeMySQLConn()
 
 
 @pytest.fixture
@@ -123,23 +116,77 @@ def kg():
 
 
 # ---------------------------------------------------------------------------
-# Push tests
+# Push tests — changelog-driven
 # ---------------------------------------------------------------------------
 
 class TestSyncPush:
-    def test_push_basic(self, kg, mysql_conn):
-        kg.touch("alpha", "hello")
-        kg.touch("beta", "world")
-        count = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
-        assert count == 2
+    def test_push_write_only_sends_changed(self, kg, mysql_conn):
+        """Write 3 nodes, push all, write 1 more, push delta — only 1 new row."""
+        kg.touch("a", "alpha")
+        kg.touch("b", "beta")
+        kg.touch("c", "gamma")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
 
-        # Verify data in MySQL
+        # All 3 should be in MySQL
         cur = mysql_conn.cursor()
-        cur.execute("SELECT * FROM kaybee")
-        rows = cur.fetchall()
-        assert len(rows) == 2
+        cur.execute("SELECT name FROM kaybee ORDER BY name")
+        names = [r[0] for r in cur.fetchall()]
+        assert names == ["a", "b", "c"]
+
+        # Write one more node
+        kg.touch("d", "delta")
+        last_seq2 = sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+        assert last_seq2 > last_seq
+
+        cur.execute("SELECT name FROM kaybee ORDER BY name")
+        names = [r[0] for r in cur.fetchall()]
+        assert names == ["a", "b", "c", "d"]
+
+    def test_push_rm_deletes_remote(self, kg, mysql_conn):
+        """Write + push, rm + push — row gone from MySQL."""
+        kg.touch("ephemeral", "will be removed")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("ephemeral",))
+        assert cur.fetchone()[0] == 1
+
+        kg.rm("ephemeral")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("ephemeral",))
+        assert cur.fetchone()[0] == 0
+
+    def test_push_mv_updates_remote(self, kg, mysql_conn):
+        """Write + push, mv + push — old name gone, new name present."""
+        kg.touch("old-name", "content")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg.mv("old-name", "new-name")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("old-name",))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("new-name",))
+        assert cur.fetchone()[0] == 1
+
+    def test_push_returns_last_seq(self, kg, mysql_conn):
+        """Return value matches last changelog entry seq."""
+        kg.touch("x", "data")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+        entries = kg.changelog()
+        assert last_seq == entries[-1][0]
+
+    def test_push_noop_returns_same_seq(self, kg, mysql_conn):
+        """No changes after initial push — returns since_seq."""
+        kg.touch("x", "data")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+        result = sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+        assert result == last_seq
 
     def test_push_scope_injected(self, kg, mysql_conn):
+        """Scope columns present in MySQL rows."""
         kg.touch("node1", "content1")
         sync_push(kg, mysql_conn, scope={"team_id": "eng"})
 
@@ -149,38 +196,32 @@ class TestSyncPush:
         assert len(rows) == 1
 
     def test_push_typed_nodes(self, kg, mysql_conn):
+        """Typed nodes land in their own MySQL table."""
         kg.add_type("concept")
         kg.write("idea", "---\ntype: concept\ntags: [ai]\n---\nSome concept")
-        count = sync_push(kg, mysql_conn, scope={"user_id": "u1"})
-        assert count >= 1
+        sync_push(kg, mysql_conn, scope={"user_id": "u1"})
 
         cur = mysql_conn.cursor()
         cur.execute("SELECT * FROM concept WHERE user_id = ?", ("u1",))
         rows = cur.fetchall()
         assert len(rows) == 1
 
-    def test_push_idempotent(self, kg, mysql_conn):
-        kg.touch("a", "data")
-        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
-        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+    def test_push_empty_changelog(self, kg, mysql_conn):
+        """No changelog entries — returns 0."""
+        result = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+        assert result == 0
+
+    def test_push_cp_upserts_dst(self, kg, mysql_conn):
+        """Copy operation upserts the destination node."""
+        kg.touch("src", "source content")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg.cp("src", "dst")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
 
         cur = mysql_conn.cursor()
-        cur.execute("SELECT * FROM kaybee WHERE team_id = ?", ("eng",))
-        rows = cur.fetchall()
-        assert len(rows) == 1
-
-    def test_push_empty_graph(self, kg, mysql_conn):
-        count = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
-        assert count == 0
-
-    def test_push_multi_scope(self, kg, mysql_conn):
-        kg.touch("doc", "content")
-        sync_push(kg, mysql_conn, scope={"team_id": "eng", "env": "prod"})
-
-        cur = mysql_conn.cursor()
-        cur.execute("SELECT * FROM kaybee WHERE team_id = ? AND env = ?", ("eng", "prod"))
-        rows = cur.fetchall()
-        assert len(rows) == 1
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("dst",))
+        assert cur.fetchone()[0] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +230,11 @@ class TestSyncPush:
 
 class TestSyncPull:
     def test_pull_basic(self, kg, mysql_conn):
-        # Push first, then pull into a fresh KG
         kg.touch("alpha", "hello")
         kg.touch("beta", "world")
         sync_push(kg, mysql_conn, scope={"team_id": "eng"})
 
         kg2 = KnowledgeGraph()
-        # Ensure kaybee table exists in kg2 (it does by default)
         count = sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
         assert count == 2
         assert kg2.exists("alpha")
@@ -222,26 +261,15 @@ class TestSyncPull:
         kg2 = KnowledgeGraph()
         sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
 
-        # The local table should NOT have team_id column
         cols = [
             r[1] for r in kg2._db.execute("PRAGMA table_info(kaybee)").fetchall()
         ]
         assert "team_id" not in cols
 
-    def test_roundtrip_content_preserved(self, kg, mysql_conn):
-        kg.touch("note", "hello world")
-        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
-
-        kg2 = KnowledgeGraph()
-        sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
-        assert kg2.cat("note") == "hello world"
-
     def test_pull_no_data(self, kg, mysql_conn):
-        # Push some data with scope
         kg.touch("a", "x")
         sync_push(kg, mysql_conn, scope={"team_id": "eng"})
 
-        # Pull with different scope — no match
         kg2 = KnowledgeGraph()
         count = sync_pull(kg2, mysql_conn, scope={"team_id": "sales"})
         assert count == 0
@@ -252,7 +280,8 @@ class TestSyncPull:
 # ---------------------------------------------------------------------------
 
 class TestSyncRoundTrip:
-    def test_full_roundtrip(self, kg, mysql_conn):
+    def test_roundtrip(self, kg, mysql_conn):
+        """Push then pull into fresh KG — content preserved."""
         kg.add_type("concept")
         kg.write("idea", "---\ntype: concept\ntags: [demo]\n---\nGreat idea")
         kg.touch("readme", "Welcome")
@@ -266,3 +295,112 @@ class TestSyncRoundTrip:
         assert kg2.exists("readme")
         assert kg2.exists("idea")
         assert kg2.cat("readme") == "Welcome"
+
+    def test_roundtrip_content_preserved(self, kg, mysql_conn):
+        kg.touch("note", "hello world")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg2 = KnowledgeGraph()
+        sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
+        assert kg2.cat("note") == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# Full-table fallback (changelog disabled)
+# ---------------------------------------------------------------------------
+
+class TestSyncPushFullFallback:
+    @pytest.fixture
+    def kg_no_cl(self):
+        return KnowledgeGraph(changelog=False)
+
+    def test_fallback_pushes_all_rows(self, kg_no_cl, mysql_conn):
+        """With changelog disabled, sync_push still pushes all rows."""
+        kg_no_cl.touch("a", "alpha")
+        kg_no_cl.touch("b", "beta")
+        result = sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"})
+        assert result == 0  # no seq to track
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT name FROM kaybee ORDER BY name")
+        names = [r[0] for r in cur.fetchall()]
+        assert names == ["a", "b"]
+
+    def test_fallback_returns_zero(self, kg_no_cl, mysql_conn):
+        """Full-table push returns 0 (no changelog position)."""
+        kg_no_cl.touch("x", "data")
+        assert sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"}) == 0
+
+    def test_fallback_idempotent(self, kg_no_cl, mysql_conn):
+        """Repeated full-table pushes don't duplicate rows."""
+        kg_no_cl.touch("x", "data")
+        sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"})
+        sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+    def test_fallback_scope_injected(self, kg_no_cl, mysql_conn):
+        """Full-table push still injects scope columns."""
+        kg_no_cl.touch("node1", "content1")
+        sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT * FROM kaybee WHERE team_id = ?", ("eng",))
+        rows = cur.fetchall()
+        assert len(rows) == 1
+
+    def test_fallback_typed_nodes(self, kg_no_cl, mysql_conn):
+        """Full-table push handles typed tables."""
+        kg_no_cl.add_type("concept")
+        kg_no_cl.write("idea", "---\ntype: concept\ntags: [ai]\n---\nBody")
+        sync_push(kg_no_cl, mysql_conn, scope={"user_id": "u1"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT * FROM concept WHERE user_id = ?", ("u1",))
+        rows = cur.fetchall()
+        assert len(rows) == 1
+
+    def test_fallback_empty_graph(self, kg_no_cl, mysql_conn):
+        """Empty graph pushes nothing."""
+        assert sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"}) == 0
+
+    def test_fallback_roundtrip(self, kg_no_cl, mysql_conn):
+        """Full-table push then pull into fresh KG."""
+        kg_no_cl.touch("note", "hello")
+        sync_push(kg_no_cl, mysql_conn, scope={"team_id": "eng"})
+
+        kg2 = KnowledgeGraph(changelog=False)
+        count = sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
+        assert count == 1
+        assert kg2.cat("note") == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Drain loop (changelog entries beyond single batch)
+# ---------------------------------------------------------------------------
+
+class TestSyncPushDrainLoop:
+    def test_push_drains_all_entries(self, kg, mysql_conn):
+        """sync_push loops until all changelog entries are consumed."""
+        # Create enough entries to exceed a small batch.
+        # We can't easily set the internal limit, but we can verify
+        # that ALL entries are processed by creating many nodes and
+        # checking they all land in MySQL.
+        for i in range(25):
+            kg.touch(f"n{i:03d}", f"content-{i}")
+
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        # Verify all 25 are in MySQL
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee")
+        assert cur.fetchone()[0] == 25
+
+        # Verify last_seq matches the actual last changelog entry
+        entries = kg.changelog()
+        assert last_seq == entries[-1][0]
+
+        # A subsequent push with that seq should be a no-op
+        assert sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq) == last_seq

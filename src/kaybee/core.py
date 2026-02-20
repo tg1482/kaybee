@@ -250,7 +250,7 @@ class KnowledgeGraph:
     grouping mechanism — no directories, no paths.
     """
 
-    def __init__(self, db_path: str = ":memory:", changelog: bool = False) -> None:
+    def __init__(self, db_path: str = ":memory:", changelog: bool = True) -> None:
         self._db = sqlite3.connect(db_path)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
