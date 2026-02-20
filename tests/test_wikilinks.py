@@ -143,9 +143,10 @@ class TestGraphAdjacency:
 class TestRmCleansGraph:
     def test_rm_cleans_type_table(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
-        assert len(kg.query("SELECT * FROM concept")) == 1
+        t = kg.data_table("concept")
+        assert len(kg.query(f"SELECT * FROM {t} WHERE name = 'item'")) == 1
         kg.rm("item")
-        assert len(kg.query("SELECT * FROM concept")) == 0
+        assert len(kg.query(f"SELECT * FROM {t} WHERE name = 'item'")) == 0
 
     def test_rm_cleans_outgoing_links(self, kg):
         kg.write("a", "Links to [[b]].")
@@ -168,7 +169,8 @@ class TestMvCpGraph:
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
         kg.mv("item", "moved")
         assert kg.find_by_type("concept") == ["moved"]
-        rows = kg.query("SELECT name FROM concept")
+        t = kg.data_table("concept")
+        rows = kg.query(f"SELECT name FROM {t} WHERE name = 'moved'")
         assert rows[0][0] == "moved"
 
     def test_mv_updates_links(self, kg):

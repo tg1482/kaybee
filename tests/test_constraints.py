@@ -16,9 +16,9 @@ from kaybee.constraints import (
 )
 
 
-@pytest.fixture
-def kg():
-    return KnowledgeGraph()
+@pytest.fixture(params=["multi", "single"])
+def kg(request):
+    return KnowledgeGraph(mode=request.param)
 
 
 @pytest.fixture

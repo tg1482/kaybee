@@ -31,15 +31,15 @@ def timed(fn):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def kg():
-    return KnowledgeGraph()
+@pytest.fixture(params=["multi", "single"])
+def kg(request):
+    return KnowledgeGraph(mode=request.param)
 
 
-@pytest.fixture
-def file_kg(tmp_path):
+@pytest.fixture(params=["multi", "single"])
+def file_kg(tmp_path, request):
     """File-backed graph for persistence stress."""
-    return KnowledgeGraph(str(tmp_path / "stress.db"))
+    return KnowledgeGraph(str(tmp_path / "stress.db"), mode=request.param)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -54,7 +54,7 @@ class TestBulkWriteThroughput:
         """Touch 100k plain nodes."""
         _, elapsed = timed(lambda: [kg.touch(f"node-{i}", f"content-{i}") for i in range(100_000)])
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 100_000
-        assert kg.query("SELECT COUNT(*) FROM kaybee")[0][0] == 100_000
+        assert kg.query(f"SELECT COUNT(*) FROM {kg.data_table()}")[0][0] == 100_000
         print(f"\n  100k untyped touch: {elapsed:.2f}s ({100_000/elapsed:.0f} ops/s)")
 
     def test_100k_typed_write(self, kg):
@@ -65,11 +65,8 @@ class TestBulkWriteThroughput:
                 kg.write(f"item-{i}", f"---\ntype: type-{t}\nfield: val-{i}\n---\nbody-{i}")
         _, elapsed = timed(do)
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 100_000
-        # Each type table should have 10k nodes
         for t in range(10):
-            safe = f"type_{t}"
-            count = kg.query(f"SELECT COUNT(*) FROM {safe}")[0][0]
-            assert count == 10_000
+            assert len(kg.find_by_type(f"type-{t}")) == 10_000
         print(f"\n  100k typed write: {elapsed:.2f}s ({100_000/elapsed:.0f} ops/s)")
 
     def test_50k_mixed_untyped_and_typed(self, kg):
@@ -142,7 +139,8 @@ class TestThinIndexCorrectness:
         assert meta["tags"] == ["a", "b"]
 
         # Direct SQL
-        row = kg.query("SELECT name, content, description, tags FROM concept WHERE name = 'x'")
+        t = kg.data_table("concept")
+        row = kg.query(f"SELECT name, content, description, tags FROM {t} WHERE name = 'x'")
         assert row[0][0] == "x"
         assert row[0][1] == "Body text"
         assert row[0][2] == "hello"
@@ -156,8 +154,8 @@ class TestThinIndexCorrectness:
         cols = {row[1] for row in kg.query("PRAGMA table_info(nodes)")}
         assert "meta" not in cols
 
-        # kaybee table should not have meta column
-        cols = {row[1] for row in kg.query("PRAGMA table_info(kaybee)")}
+        # data table should not have meta column
+        cols = {row[1] for row in kg.query(f"PRAGMA table_info({kg.data_table()})")}
         assert "meta" not in cols
 
 
@@ -286,17 +284,10 @@ class TestTypeSwitching:
         assert meta["type"] == "type-49"
         assert meta["idx"] == "9999"
 
-        # Should only be in the final type table
-        for t in range(50):
-            safe = f"type_{t}"
-            try:
-                rows = kg.query(f"SELECT COUNT(*) FROM {safe} WHERE name = 'chameleon'")
-                if t == 49:
-                    assert rows[0][0] == 1
-                else:
-                    assert rows[0][0] == 0
-            except sqlite3.OperationalError:
-                pass
+        # Should only be in the final type
+        assert kg.find_by_type("type-49") == ["chameleon"]
+        for t in range(49):
+            assert kg.find_by_type(f"type-{t}") == []
         print(f"\n  10k type switches: {elapsed:.2f}s ({10_000/elapsed:.0f} ops/s)")
 
     def test_bulk_type_migration(self, kg):
@@ -304,15 +295,15 @@ class TestTypeSwitching:
         for i in range(10_000):
             kg.write(f"item-{i}", f"---\ntype: old\nfield: v{i}\n---\nbody")
 
-        assert kg.query("SELECT COUNT(*) FROM old")[0][0] == 10_000
+        assert len(kg.find_by_type("old")) == 10_000
 
         def migrate():
             for i in range(10_000):
                 kg.write(f"item-{i}", f"---\ntype: new\nfield: v{i}\n---\nbody")
 
         _, elapsed = timed(migrate)
-        assert kg.query("SELECT COUNT(*) FROM old")[0][0] == 0
-        assert kg.query("SELECT COUNT(*) FROM new")[0][0] == 10_000
+        assert len(kg.find_by_type("old")) == 0
+        assert len(kg.find_by_type("new")) == 10_000
         print(f"\n  10k type migration: {elapsed:.2f}s ({10_000/elapsed:.0f} ops/s)")
 
 
@@ -328,7 +319,8 @@ class TestSchemaEvolution:
             fields = "\n".join(f"field_{j}: val_{j}" for j in range(i + 1))
             kg.write(f"node-{i}", f"---\ntype: wide\n{fields}\n---\nbody-{i}")
 
-        cols = {row[1] for row in kg.query("PRAGMA table_info(wide)")}
+        t = kg.data_table("wide")
+        cols = {row[1] for row in kg.query(f"PRAGMA table_info({t})")}
         assert len(cols) >= 102  # name + content + 100 fields
         # All nodes should still be readable
         for i in range(100):
@@ -337,12 +329,13 @@ class TestSchemaEvolution:
             assert meta["field_0"] == "val_0"
 
     def test_sparse_wide_kaybee_table(self, kg):
-        """Untyped nodes with different frontmatter fields create sparse kaybee table."""
+        """Untyped nodes with different frontmatter fields create sparse data table."""
         for i in range(1000):
             field_name = f"field_{i % 50}"
             kg.write(f"sparse-{i}", f"---\n{field_name}: value-{i}\n---\nbody-{i}")
 
-        cols = {row[1] for row in kg.query("PRAGMA table_info(kaybee)")}
+        t = kg.data_table()
+        cols = {row[1] for row in kg.query(f"PRAGMA table_info({t})")}
         assert len(cols) >= 52  # name + content + 50 unique fields
         # Spot check
         content, meta = kg._read_node_data("sparse-0")
@@ -402,7 +395,7 @@ class TestDeleteAtScale:
 
         _, elapsed = timed(do)
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 0
-        assert kg.query("SELECT COUNT(*) FROM kaybee")[0][0] == 0
+        assert kg.query(f"SELECT COUNT(*) FROM {kg.data_table()}")[0][0] == 0
         print(f"\n  rm 10k nodes: {elapsed:.2f}s ({10_000/elapsed:.0f} ops/s)")
 
     def test_rm_typed_cleans_type_table(self, kg):
@@ -410,13 +403,14 @@ class TestDeleteAtScale:
         for i in range(5000):
             kg.write(f"item-{i}", f"---\ntype: ephemeral\n---\nbody-{i}")
 
-        assert kg.query("SELECT COUNT(*) FROM ephemeral")[0][0] == 5000
+        t = kg.data_table("ephemeral")
+        assert kg.query(f"SELECT COUNT(*) FROM {t}")[0][0] == 5000
 
         for i in range(5000):
             kg.rm(f"item-{i}")
 
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 0
-        assert kg.query("SELECT COUNT(*) FROM ephemeral")[0][0] == 0
+        assert kg.query(f"SELECT COUNT(*) FROM {t}")[0][0] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -438,7 +432,9 @@ class TestMvCpAtScale:
         assert not kg.exists("old-0")
         assert kg.exists("new-0")
         assert kg.frontmatter("new-0")["field"] == "v0"
-        assert kg.query("SELECT COUNT(*) FROM movable")[0][0] == 5000
+        t = kg.data_table("movable")
+        count = kg.query(f"SELECT COUNT(*) FROM {t}")[0][0]
+        assert count == 5000
         print(f"\n  mv 5k nodes: {elapsed:.2f}s ({5000/elapsed:.0f} ops/s)")
 
     def test_cp_5k_nodes(self, kg):
@@ -452,7 +448,8 @@ class TestMvCpAtScale:
 
         _, elapsed = timed(do)
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 10_000
-        assert kg.query("SELECT COUNT(*) FROM copyable")[0][0] == 10_000
+        t = kg.data_table("copyable")
+        assert kg.query(f"SELECT COUNT(*) FROM {t}")[0][0] == 10_000
         print(f"\n  cp 5k nodes: {elapsed:.2f}s ({5000/elapsed:.0f} ops/s)")
 
 
@@ -516,10 +513,14 @@ class TestGatekeeperPerformance:
 
 
 class TestPersistenceAtScale:
-    def test_50k_nodes_survive_reopen(self, tmp_path):
+    @pytest.fixture(params=["multi", "single"])
+    def mode(self, request):
+        return request.param
+
+    def test_50k_nodes_survive_reopen(self, tmp_path, mode):
         """Write 50k nodes, close, reopen, verify all data."""
         path = str(tmp_path / "big.db")
-        kg1 = KnowledgeGraph(path)
+        kg1 = KnowledgeGraph(path, mode=mode)
         for i in range(50_000):
             if i % 2 == 0:
                 kg1.touch(f"plain-{i}", f"content-{i}")
@@ -527,7 +528,7 @@ class TestPersistenceAtScale:
                 kg1.write(f"typed-{i}", f"---\ntype: t-{i % 5}\nfield: v{i}\n---\nbody-{i}")
         kg1._db.close()
 
-        kg2 = KnowledgeGraph(path)
+        kg2 = KnowledgeGraph(path, mode=mode)
         assert kg2.query("SELECT COUNT(*) FROM nodes")[0][0] == 50_000
 
         # Spot check
@@ -538,17 +539,17 @@ class TestPersistenceAtScale:
         assert kg2.info("typed-101")["type"] == "t-1"
         kg2._db.close()
 
-    def test_incremental_writes_across_reopens(self, tmp_path):
+    def test_incremental_writes_across_reopens(self, tmp_path, mode):
         """Write in batches across 10 reopen cycles."""
         path = str(tmp_path / "incremental.db")
         for batch in range(10):
-            kg = KnowledgeGraph(path)
+            kg = KnowledgeGraph(path, mode=mode)
             for i in range(1000):
                 idx = batch * 1000 + i
                 kg.write(f"item-{idx}", f"---\ntype: batch-{batch}\n---\nbody-{idx}")
             kg._db.close()
 
-        kg = KnowledgeGraph(path)
+        kg = KnowledgeGraph(path, mode=mode)
         assert kg.query("SELECT COUNT(*) FROM nodes")[0][0] == 10_000
         assert len(kg.types()) == 10
         for batch in range(10):
@@ -601,22 +602,24 @@ class TestDirectSQLVerification:
         for i in range(1000):
             kg.write(f"item-{i}", f"---\ntype: product\nprice: {i * 10}\ncategory: cat-{i % 5}\n---\ndescription-{i}")
 
+        t = kg.data_table("product")
         # Real SQL column queries
-        rows = kg.query("SELECT name, price, category FROM product WHERE category = 'cat-0' ORDER BY name")
+        rows = kg.query(f"SELECT name, price, category FROM {t} WHERE category = 'cat-0' ORDER BY name")
         assert len(rows) == 200
 
         # Aggregate
-        rows = kg.query("SELECT category, COUNT(*) FROM product GROUP BY category ORDER BY category")
+        rows = kg.query(f"SELECT category, COUNT(*) FROM {t} GROUP BY category ORDER BY category")
         assert len(rows) == 5
         for _, count in rows:
             assert count == 200
 
     def test_query_kaybee_table_directly(self, kg):
-        """Users can query the kaybee table for untyped nodes."""
+        """Users can query the data table for untyped nodes."""
         for i in range(1000):
             kg.write(f"note-{i}", f"---\nmood: {['happy', 'sad', 'neutral'][i % 3]}\n---\ncontent-{i}")
 
-        rows = kg.query("SELECT name, mood FROM kaybee WHERE mood = 'happy' ORDER BY name")
+        t = kg.data_table()
+        rows = kg.query(f"SELECT name, mood FROM {t} WHERE mood = 'happy' ORDER BY name")
         assert len(rows) == 334  # ceil(1000/3)
 
     def test_nodes_index_only_has_name_type(self, kg):

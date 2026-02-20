@@ -49,21 +49,23 @@ class TestFrontmatterWrite:
 class TestTypeTables:
     def test_type_table_created(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
-        rows = kg.query("SELECT name, description FROM concept")
+        t = kg.data_table("concept")
+        rows = kg.query(f"SELECT name, description FROM {t} WHERE name = 'item'")
         assert len(rows) == 1
         assert rows[0] == ("item", "test")
 
     def test_type_table_columns_extended(self, kg):
         kg.write("a", "---\ntype: concept\ndescription: first\n---\nA.")
         kg.write("b", "---\ntype: concept\npriority: high\n---\nB.")
-        rows = kg.query("SELECT name, description, priority FROM concept ORDER BY name")
+        t = kg.data_table("concept")
+        rows = kg.query(f"SELECT name, description, priority FROM {t} WHERE name IN ('a', 'b') ORDER BY name")
         assert len(rows) == 2
 
     def test_multiple_types(self, kg):
         kg.write("a", "---\ntype: concept\n---\nA")
         kg.write("b", "---\ntype: note\n---\nB")
-        assert len(kg.query("SELECT * FROM concept")) == 1
-        assert len(kg.query("SELECT * FROM note")) == 1
+        assert kg.find_by_type("concept") == ["a"]
+        assert kg.find_by_type("note") == ["b"]
 
     def test_overwrite_changes_type(self, kg):
         kg.write("item", "---\ntype: concept\n---\nOld.")
@@ -75,12 +77,14 @@ class TestTypeTables:
     def test_overwrite_same_type(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: v1\n---\nV1.")
         kg.write("item", "---\ntype: concept\ndescription: v2\n---\nV2.")
-        rows = kg.query("SELECT description FROM concept WHERE name = 'item'")
+        t = kg.data_table("concept")
+        rows = kg.query(f"SELECT description FROM {t} WHERE name = 'item'")
         assert rows[0][0] == "v2"
 
     def test_list_value_in_type_table(self, kg):
         kg.write("item", "---\ntype: concept\ntags: [a, b]\n---\nBody.")
-        rows = kg.query("SELECT tags FROM concept WHERE name = 'item'")
+        t = kg.data_table("concept")
+        rows = kg.query(f"SELECT tags FROM {t} WHERE name = 'item'")
         assert "a" in rows[0][0]
         assert "b" in rows[0][0]
 
