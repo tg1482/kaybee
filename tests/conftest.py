@@ -5,16 +5,16 @@ import pytest
 from kaybee.core import KnowledgeGraph
 
 
-@pytest.fixture
-def kg():
+@pytest.fixture(params=["multi", "single"])
+def kg(request):
     """Fresh in-memory KnowledgeGraph."""
-    return KnowledgeGraph()
+    return KnowledgeGraph(mode=request.param)
 
 
-@pytest.fixture
-def populated_kg():
+@pytest.fixture(params=["multi", "single"])
+def populated_kg(request):
     """KnowledgeGraph pre-loaded with a small knowledge base."""
-    kg = KnowledgeGraph()
+    kg = KnowledgeGraph(mode=request.param)
     kg.add_type("concept")
     kg.add_type("person")
 

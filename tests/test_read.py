@@ -5,9 +5,9 @@ import pytest
 from kaybee.core import KnowledgeGraph
 
 
-@pytest.fixture
-def kg():
-    return KnowledgeGraph()
+@pytest.fixture(params=["multi", "single"])
+def kg(request):
+    return KnowledgeGraph(mode=request.param)
 
 
 @pytest.fixture
