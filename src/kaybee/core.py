@@ -381,8 +381,10 @@ class KnowledgeGraph:
         table = self.data_table(type_name)
         try:
             self._db.execute(f"DELETE FROM {table} WHERE name = ?", (name,))
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return
+            raise
 
     def _content_rows(self, type_name: str | None = None) -> list[tuple[str, str]]:
         """Return ``(name, content)`` pairs, optionally filtered by type.
@@ -562,30 +564,47 @@ class KnowledgeGraph:
             if violations:
                 raise ValidationError(violations)
 
-        old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
-        old_type = old[0] if old else None
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
+            old_type = old[0] if old else None
+            type_changed = old_type is not None and old_type != effective_type
 
-        # Handle type change: delete from old type table
-        if old_type and old_type != effective_type:
-            self._delete_data_row(old_type, name)
+            # Handle type change: delete from old type table
+            if type_changed:
+                self._delete_data_row(old_type, name)
 
-        # Thin index: name + type only
-        self._db.execute(
-            "INSERT OR REPLACE INTO nodes (name, type) VALUES (?, ?)",
-            (name, effective_type),
-        )
+            # Store data in type table BEFORE updating the index so a crash
+            # never leaves the nodes table pointing at a missing data row.
+            self._upsert_type_row(effective_type, name, body, meta)
 
-        # Store data in type table (works for both kaybee and typed tables)
-        self._upsert_type_row(effective_type, name, body, meta)
+            # Thin index: name + type only
+            self._db.execute(
+                "INSERT OR REPLACE INTO nodes (name, type) VALUES (?, ?)",
+                (name, effective_type),
+            )
 
-        # Auto-register typed nodes in _types (not kaybee)
-        if effective_type != "kaybee":
-            self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (effective_type,))
+            # Auto-register typed nodes in _types (not kaybee)
+            if effective_type != "kaybee":
+                self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (effective_type,))
 
-        self._sync_links(name, body)
-        self._re_resolve_links_to(name)
-        self._log("node.write", name, {"type": effective_type, "content": body, "meta": meta})
-        self._db.commit()
+            self._sync_links(name, body)
+            self._re_resolve_links_to(name)
+
+            if type_changed:
+                self._log("node.type_change", name, {
+                    "old_type": old_type,
+                    "type": effective_type,
+                    "content": body,
+                    "meta": meta,
+                })
+            else:
+                self._log("node.write", name, {"type": effective_type, "content": body, "meta": meta})
+
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Type management

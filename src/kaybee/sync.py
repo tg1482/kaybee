@@ -255,6 +255,14 @@ def sync_push(kg, mysql_conn, scope: dict, *, since_seq: int = 0) -> int:
                 _delete_from_mysql(cursor, type_name, old_name, scope, _cache=cache)
                 _upsert_to_mysql(cursor, type_name, name, content, meta, scope, _cache=cache)
 
+            elif op == "node.type_change":
+                old_type = data.get("old_type", "kaybee")
+                new_type = data.get("type", "kaybee")
+                content = data.get("content", "")
+                meta = data.get("meta", {})
+                _delete_from_mysql(cursor, old_type, name, scope, _cache=cache)
+                _upsert_to_mysql(cursor, new_type, name, content, meta, scope, _cache=cache)
+
             elif op == "node.cp":
                 type_name = data.get("type", "kaybee")
                 content = data.get("content", "")

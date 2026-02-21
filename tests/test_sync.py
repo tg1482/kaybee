@@ -404,3 +404,191 @@ class TestSyncPushDrainLoop:
 
         # A subsequent push with that seq should be a no-op
         assert sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq) == last_seq
+
+
+# ---------------------------------------------------------------------------
+# Type change sync
+# ---------------------------------------------------------------------------
+
+class TestSyncTypeChange:
+    def test_push_type_change_deletes_old_row(self, kg, mysql_conn):
+        """Changing a node's type should delete the old MySQL row and create a new one."""
+        kg.write("x", "---\ntype: concept\ndesc: original\n---\nBody")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM concept WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+        # Change type from concept to person
+        kg.write("x", "---\ntype: person\nrole: dev\n---\nBody")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        # Old row gone from concept table
+        cur.execute("SELECT COUNT(*) FROM concept WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 0
+
+        # New row present in person table
+        cur.execute("SELECT COUNT(*) FROM person WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+    def test_push_type_change_to_kaybee(self, kg, mysql_conn):
+        """Changing from typed to untyped removes old row and adds to kaybee."""
+        kg.write("x", "---\ntype: concept\n---\nBody")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg.write("x", "Now untyped")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM concept WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+    def test_push_type_change_from_kaybee(self, kg, mysql_conn):
+        """Changing from untyped to typed removes old row and adds to new type."""
+        kg.touch("x", "plain text")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg.write("x", "---\ntype: concept\n---\nNow typed")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT COUNT(*) FROM concept WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+    def test_type_change_roundtrip(self, kg, mysql_conn):
+        """Type change pushed then pulled into fresh KG preserves new type."""
+        kg.write("x", "---\ntype: concept\n---\nOriginal")
+        last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        kg.write("x", "---\ntype: person\nrole: dev\n---\nChanged")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        kg2 = KnowledgeGraph()
+        sync_pull(kg2, mysql_conn, scope={"team_id": "eng"})
+        assert kg2.exists("x")
+        info = kg2.info("x")
+        assert info["type"] == "person"
+
+
+# ---------------------------------------------------------------------------
+# Single-mode sync
+# ---------------------------------------------------------------------------
+
+class TestSyncSingleMode:
+    @pytest.fixture
+    def kg_single(self):
+        return KnowledgeGraph(mode="single")
+
+    # -- Push (changelog-driven) --
+
+    def test_push_single_mode(self, kg_single, mysql_conn):
+        """Single-mode KG can push nodes via changelog."""
+        kg_single.touch("a", "alpha")
+        kg_single.write("b", "---\ntype: concept\ntags: [ai]\n---\nBody")
+        sync_push(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT name FROM kaybee ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["a"]
+        cur.execute("SELECT name FROM concept ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["b"]
+
+    def test_push_single_mode_rm(self, kg_single, mysql_conn):
+        """Single-mode rm propagates to MySQL."""
+        kg_single.touch("gone", "ephemeral")
+        last_seq = sync_push(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        kg_single.rm("gone")
+        sync_push(kg_single, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM kaybee WHERE name = ?", ("gone",))
+        assert cur.fetchone()[0] == 0
+
+    def test_push_single_mode_type_change(self, kg_single, mysql_conn):
+        """Single-mode type change deletes old MySQL row."""
+        kg_single.write("x", "---\ntype: concept\n---\nBody")
+        last_seq = sync_push(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        kg_single.write("x", "---\ntype: person\n---\nBody")
+        sync_push(kg_single, mysql_conn, scope={"team_id": "eng"}, since_seq=last_seq)
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM concept WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT COUNT(*) FROM person WHERE name = ?", ("x",))
+        assert cur.fetchone()[0] == 1
+
+    # -- Push (full-table fallback) --
+
+    def test_push_single_mode_no_changelog(self, mysql_conn):
+        """Single-mode with changelog disabled uses full-table push."""
+        kg = KnowledgeGraph(mode="single", changelog=False)
+        kg.touch("a", "alpha")
+        kg.write("b", "---\ntype: concept\n---\nBody")
+        result = sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+        assert result == 0
+
+        cur = mysql_conn.cursor()
+        cur.execute("SELECT name FROM kaybee ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["a"]
+        cur.execute("SELECT name FROM concept ORDER BY name")
+        assert [r[0] for r in cur.fetchall()] == ["b"]
+
+    # -- Pull --
+
+    def test_pull_into_single_mode(self, kg, kg_single, mysql_conn):
+        """Pull from MySQL into a single-mode KG."""
+        kg.write("idea", "---\ntype: concept\ndesc: smart\n---\nBody")
+        kg.touch("note", "plain text")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        count = sync_pull(kg_single, mysql_conn, scope={"team_id": "eng"})
+        assert count == 2
+        assert kg_single.exists("idea")
+        assert kg_single.exists("note")
+
+    def test_pull_single_mode_type_fields(self, kg, kg_single, mysql_conn):
+        """Pull into single-mode registers fields in _type_fields."""
+        kg.write("idea", "---\ntype: concept\ndesc: smart\ntags: [ai]\n---\nBody")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        sync_pull(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        rows = kg_single.query(
+            "SELECT field_name FROM _type_fields WHERE type_name = ? ORDER BY field_name",
+            ("concept",),
+        )
+        field_names = [r[0] for r in rows]
+        assert "desc" in field_names
+        assert "tags" in field_names
+
+    def test_pull_single_mode_data_in_unified_table(self, kg, kg_single, mysql_conn):
+        """Pull routes all types to _data in single mode."""
+        kg.write("c1", "---\ntype: concept\n---\nBody1")
+        kg.write("p1", "---\ntype: person\n---\nBody2")
+        sync_push(kg, mysql_conn, scope={"team_id": "eng"})
+
+        sync_pull(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        # Both should be in the _data table
+        rows = kg_single.query("SELECT name FROM _data ORDER BY name")
+        names = [r[0] for r in rows]
+        assert "c1" in names
+        assert "p1" in names
+
+    def test_roundtrip_single_to_multi(self, kg_single, mysql_conn):
+        """Push from single-mode, pull into multi-mode — data preserved."""
+        kg_single.write("idea", "---\ntype: concept\ndesc: good\n---\nBody")
+        sync_push(kg_single, mysql_conn, scope={"team_id": "eng"})
+
+        kg_multi = KnowledgeGraph()
+        sync_pull(kg_multi, mysql_conn, scope={"team_id": "eng"})
+        assert kg_multi.exists("idea")
+        info = kg_multi.info("idea")
+        assert info["type"] == "concept"
