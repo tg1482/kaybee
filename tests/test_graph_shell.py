@@ -5,9 +5,9 @@ import pytest
 from kaybee import GraphShell, KnowledgeGraph
 
 
-@pytest.fixture(params=["multi", "single"])
-def sh(request):
-    kg = KnowledgeGraph(mode=request.param)
+@pytest.fixture
+def sh():
+    kg = KnowledgeGraph()
     return GraphShell(kg)
 
 

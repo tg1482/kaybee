@@ -143,7 +143,7 @@ class TestGraphAdjacency:
 class TestRmCleansGraph:
     def test_rm_cleans_type_table(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
-        t = kg.data_table("concept")
+        t = "_data"
         assert len(kg.query(f"SELECT * FROM {t} WHERE name = 'item'")) == 1
         kg.rm("item")
         assert len(kg.query(f"SELECT * FROM {t} WHERE name = 'item'")) == 0
@@ -169,7 +169,7 @@ class TestMvCpGraph:
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
         kg.mv("item", "moved")
         assert kg.find_by_type("concept") == ["moved"]
-        t = kg.data_table("concept")
+        t = "_data"
         rows = kg.query(f"SELECT name FROM {t} WHERE name = 'moved'")
         assert rows[0][0] == "moved"
 

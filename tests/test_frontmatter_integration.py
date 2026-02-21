@@ -49,7 +49,7 @@ class TestFrontmatterWrite:
 class TestTypeTables:
     def test_type_table_created(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: test\n---\nBody.")
-        t = kg.data_table("concept")
+        t = "_data"
         rows = kg.query(f"SELECT name, description FROM {t} WHERE name = 'item'")
         assert len(rows) == 1
         assert rows[0] == ("item", "test")
@@ -57,7 +57,7 @@ class TestTypeTables:
     def test_type_table_columns_extended(self, kg):
         kg.write("a", "---\ntype: concept\ndescription: first\n---\nA.")
         kg.write("b", "---\ntype: concept\npriority: high\n---\nB.")
-        t = kg.data_table("concept")
+        t = "_data"
         rows = kg.query(f"SELECT name, description, priority FROM {t} WHERE name IN ('a', 'b') ORDER BY name")
         assert len(rows) == 2
 
@@ -77,13 +77,13 @@ class TestTypeTables:
     def test_overwrite_same_type(self, kg):
         kg.write("item", "---\ntype: concept\ndescription: v1\n---\nV1.")
         kg.write("item", "---\ntype: concept\ndescription: v2\n---\nV2.")
-        t = kg.data_table("concept")
+        t = "_data"
         rows = kg.query(f"SELECT description FROM {t} WHERE name = 'item'")
         assert rows[0][0] == "v2"
 
     def test_list_value_in_type_table(self, kg):
         kg.write("item", "---\ntype: concept\ntags: [a, b]\n---\nBody.")
-        t = kg.data_table("concept")
+        t = "_data"
         rows = kg.query(f"SELECT tags FROM {t} WHERE name = 'item'")
         assert "a" in rows[0][0]
         assert "b" in rows[0][0]

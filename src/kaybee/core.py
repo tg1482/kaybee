@@ -215,7 +215,7 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 _RESERVED_TYPE_NAMES = frozenset({"nodes", "_types", "_links", "_changelog", "_data", "_type_fields"})
 
-_SCHEMA_SQL_COMMON = """
+_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
     name    TEXT PRIMARY KEY,
     type    TEXT NOT NULL DEFAULT 'kaybee'
@@ -235,16 +235,7 @@ CREATE TABLE IF NOT EXISTS _links (
     PRIMARY KEY (source_name, target_name)
 );
 CREATE INDEX IF NOT EXISTS idx_links_target ON _links(target_resolved);
-"""
 
-_SCHEMA_SQL_MULTI = """
-CREATE TABLE IF NOT EXISTS kaybee (
-    name    TEXT PRIMARY KEY,
-    content TEXT DEFAULT ''
-);
-"""
-
-_SCHEMA_SQL_SINGLE = """
 CREATE TABLE IF NOT EXISTS _data (
     name    TEXT PRIMARY KEY,
     content TEXT DEFAULT ''
@@ -257,22 +248,18 @@ CREATE TABLE IF NOT EXISTS _type_fields (
 );
 """
 
-# user_version values: 0 or 1 = multi, 2 = single
-_USER_VERSION_MULTI = 1
-_USER_VERSION_SINGLE = 2
-
 
 class KnowledgeGraph:
     """A flat SQLite-native knowledge graph.
 
     Nodes are identified by name (auto-slugified).  ``type`` is the sole
     grouping mechanism — no directories, no paths.
+
+    All node data lives in a single ``_data`` table. A ``_type_fields``
+    table tracks which columns belong to which type.
     """
 
-    def __init__(self, db_path: str = ":memory:", *, mode: str = "multi", changelog: bool = True) -> None:
-        if mode not in ("multi", "single"):
-            raise ValueError(f"Invalid mode: '{mode}'. Must be 'multi' or 'single'.")
-        self._mode = mode
+    def __init__(self, db_path: str = ":memory:", *, changelog: bool = True) -> None:
         self._db = sqlite3.connect(db_path)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
@@ -281,25 +268,7 @@ class KnowledgeGraph:
         self._init_schema()
 
     def _init_schema(self) -> None:
-        expected_version = _USER_VERSION_MULTI if self._mode == "multi" else _USER_VERSION_SINGLE
-        current_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-
-        # Version 0 = fresh database (never stamped), accept any mode
-        if current_version != 0:
-            if current_version != expected_version:
-                mode_label = "multi" if current_version == _USER_VERSION_MULTI else "single"
-                raise ValueError(
-                    f"Database was created with mode='{mode_label}' "
-                    f"but opened with mode='{self._mode}'."
-                )
-
-        self._db.executescript(_SCHEMA_SQL_COMMON)
-        if self._mode == "multi":
-            self._db.executescript(_SCHEMA_SQL_MULTI)
-        else:
-            self._db.executescript(_SCHEMA_SQL_SINGLE)
-
-        self._db.execute(f"PRAGMA user_version = {expected_version}")
+        self._db.executescript(_SCHEMA_SQL)
         if self._changelog:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS _changelog ("
@@ -323,40 +292,22 @@ class KnowledgeGraph:
     # Internal: type-table management
     # ------------------------------------------------------------------
 
-    def data_table(self, type_name: str = "kaybee") -> str:
-        """Return the SQL table name where *type_name*'s data lives.
-
-        In single mode every type maps to ``_data``.
-        In multi mode each type has its own table (sanitised via _safe_ident).
-
-        Useful for callers that need to run raw SQL via ``query()``.
-        """
-        if self._mode == "single":
-            return "_data"
-        return _safe_ident(type_name)
-
     def _ensure_type_table(self, type_name: str, keys: list[str]) -> None:
         if type_name != "kaybee" and type_name in _RESERVED_TYPE_NAMES:
             raise ValueError(f"Reserved type name: '{type_name}'")
         if type_name == "kaybee" and _safe_ident(type_name) != "kaybee":
             raise ValueError(f"Reserved type name: '{type_name}'")
 
-        table = self.data_table(type_name)
-
-        if self._mode == "multi":
-            self._db.execute(
-                f"CREATE TABLE IF NOT EXISTS {table} (name TEXT PRIMARY KEY, content TEXT)"
-            )
-
         existing = {
             row[1]
-            for row in self._db.execute(f"PRAGMA table_info({table})").fetchall()
+            for row in self._db.execute("PRAGMA table_info(_data)").fetchall()
         }
         for key in keys:
             col = _safe_ident(key)
             if col not in existing:
-                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
-            if self._mode == "single" and type_name != "kaybee":
+                self._db.execute(f"ALTER TABLE _data ADD COLUMN {col} TEXT")
+                existing.add(col)
+            if type_name != "kaybee":
                 self._db.execute(
                     "INSERT OR IGNORE INTO _type_fields (type_name, field_name) VALUES (?, ?)",
                     (type_name, col),
@@ -366,25 +317,18 @@ class KnowledgeGraph:
         keys = [k for k in meta if k != "type"]
         self._ensure_type_table(type_name, keys)
 
-        target_table = self.data_table(type_name)
         cols = ["name", "content"] + [_safe_ident(k) for k in keys]
         placeholders = ", ".join(["?"] * len(cols))
         col_str = ", ".join(cols)
         vals = [name, content] + [json.dumps(v) if isinstance(v, (list, dict)) else str(v) for v in (meta[k] for k in keys)]
 
         self._db.execute(
-            f"INSERT OR REPLACE INTO {target_table} ({col_str}) VALUES ({placeholders})",
+            f"INSERT OR REPLACE INTO _data ({col_str}) VALUES ({placeholders})",
             vals,
         )
 
     def _delete_data_row(self, type_name: str, name: str) -> None:
-        table = self.data_table(type_name)
-        try:
-            self._db.execute(f"DELETE FROM {table} WHERE name = ?", (name,))
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                return
-            raise
+        self._db.execute("DELETE FROM _data WHERE name = ?", (name,))
 
     def _content_rows(self, type_name: str | None = None) -> list[tuple[str, str]]:
         """Return ``(name, content)`` pairs, optionally filtered by type.
@@ -392,44 +336,16 @@ class KnowledgeGraph:
         Single centralised content scanner used by ``grep`` and ``tags``.
         """
         if type_name is not None:
-            table = self.data_table(type_name)
-            if self._mode == "single":
-                return self._db.execute(
-                    f"SELECT d.name, d.content FROM {table} d "
-                    "JOIN nodes n ON n.name = d.name "
-                    "WHERE n.type = ? ORDER BY d.name",
-                    (type_name,),
-                ).fetchall()
-            try:
-                return self._db.execute(
-                    f"SELECT name, content FROM {table} ORDER BY name"
-                ).fetchall()
-            except sqlite3.OperationalError:
-                return []
-
-        # All types
-        if self._mode == "single":
-            return self._db.execute("SELECT name, content FROM _data").fetchall()
-
-        type_rows = self._db.execute(
-            "SELECT DISTINCT type FROM nodes"
-        ).fetchall()
-        if not type_rows:
-            return []
-        parts: list[str] = []
-        for (t,) in type_rows:
-            safe = _safe_ident(t)
-            try:
-                self._db.execute(f"SELECT 1 FROM {safe} LIMIT 0")
-                parts.append(f"SELECT name, content FROM {safe}")
-            except sqlite3.OperationalError:
-                continue
-        if not parts:
-            return []
-        return self._db.execute(" UNION ALL ".join(parts)).fetchall()
+            return self._db.execute(
+                "SELECT d.name, d.content FROM _data d "
+                "JOIN nodes n ON n.name = d.name "
+                "WHERE n.type = ? ORDER BY d.name",
+                (type_name,),
+            ).fetchall()
+        return self._db.execute("SELECT name, content FROM _data ORDER BY name").fetchall()
 
     def _read_node_data(self, name: str) -> tuple[str, dict]:
-        """Read content and meta from the node's type table.
+        """Read content and meta from the ``_data`` table.
 
         Returns ``(content, meta_dict)`` where meta_dict includes ``type``
         for typed nodes (not kaybee).
@@ -441,24 +357,19 @@ class KnowledgeGraph:
             raise KeyError(name)
         type_name = row[0]
 
-        source_table = self.data_table(type_name)
-
-        try:
-            data_row = self._db.execute(
-                f"SELECT * FROM {source_table} WHERE name = ?", (name,)
-            ).fetchone()
-        except sqlite3.OperationalError:
-            return ("", {"type": type_name} if type_name != "kaybee" else {})
+        data_row = self._db.execute(
+            "SELECT * FROM _data WHERE name = ?", (name,)
+        ).fetchone()
 
         if data_row is None:
             return ("", {"type": type_name} if type_name != "kaybee" else {})
 
         col_names = [
-            desc[1] for desc in self._db.execute(f"PRAGMA table_info({source_table})").fetchall()
+            desc[1] for desc in self._db.execute("PRAGMA table_info(_data)").fetchall()
         ]
 
-        # In single mode, filter to only columns relevant to this type
-        if self._mode == "single" and type_name != "kaybee":
+        # Filter to only columns relevant to this type
+        if type_name != "kaybee":
             type_fields = {
                 r[0] for r in self._db.execute(
                     "SELECT field_name FROM _type_fields WHERE type_name = ?",
@@ -478,7 +389,7 @@ class KnowledgeGraph:
                 continue
             if val is None:
                 continue
-            # In single mode, skip columns not belonging to this type
+            # Skip columns not belonging to this type
             if type_fields is not None and col not in type_fields:
                 continue
             # Try to parse JSON-encoded values (lists/dicts)
@@ -574,8 +485,8 @@ class KnowledgeGraph:
             if type_changed:
                 self._delete_data_row(old_type, name)
 
-            # Store data in type table BEFORE updating the index so a crash
-            # never leaves the nodes table pointing at a missing data row.
+            # Store data BEFORE updating the index so a crash never leaves
+            # the nodes table pointing at a missing data row.
             self._upsert_type_row(effective_type, name, body, meta)
 
             # Thin index: name + type only
@@ -724,10 +635,9 @@ class KnowledgeGraph:
             raise KeyError(name)
 
         row = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
-        if row and row[0]:
-            self._delete_data_row(row[0], name)
-
         type_name = row[0] if row else "kaybee"
+        self._delete_data_row(type_name, name)
+
         self._db.execute("DELETE FROM _links WHERE source_name = ?", (name,))
         self._db.execute(
             "UPDATE _links SET target_resolved = NULL WHERE target_resolved = ?", (name,)
@@ -847,9 +757,9 @@ class KnowledgeGraph:
 
         # Untyped nodes (kaybee type)
         untyped_rows = self._db.execute(
-            f"SELECT k.name, k.content FROM {self.data_table()} k "
-            "JOIN nodes n ON n.name = k.name "
-            "WHERE n.type = 'kaybee' ORDER BY k.name"
+            "SELECT d.name, d.content FROM _data d "
+            "JOIN nodes n ON n.name = d.name "
+            "WHERE n.type = 'kaybee' ORDER BY d.name"
         ).fetchall()
         if untyped_rows:
             lines.append("(untyped)")
@@ -1060,28 +970,19 @@ class KnowledgeGraph:
             return t if isinstance(t, list) else []
 
         tag_map: dict[str, list[str]] = {}
-        tables = (
-            [self.data_table()]
-            if self._mode == "single"
-            else [_safe_ident(t) for (t,) in self._db.execute("SELECT DISTINCT type FROM nodes").fetchall()]
-        )
-        for table in tables:
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(_data)").fetchall()}
+        if "tags" not in cols:
+            return tag_map
+        for rname, tags_val in self._db.execute(
+            "SELECT name, tags FROM _data WHERE tags IS NOT NULL"
+        ).fetchall():
             try:
-                cols = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()}
-            except sqlite3.OperationalError:
+                node_tags = json.loads(tags_val)
+            except (json.JSONDecodeError, ValueError):
                 continue
-            if "tags" not in cols:
-                continue
-            for rname, tags_val in self._db.execute(
-                f"SELECT name, tags FROM {table} WHERE tags IS NOT NULL"
-            ).fetchall():
-                try:
-                    node_tags = json.loads(tags_val)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if isinstance(node_tags, list):
-                    for tag in node_tags:
-                        tag_map.setdefault(tag, []).append(rname)
+            if isinstance(node_tags, list):
+                for tag in node_tags:
+                    tag_map.setdefault(tag, []).append(rname)
         return tag_map
 
     def schema(self) -> dict[str, list[str]]:
@@ -1089,24 +990,12 @@ class KnowledgeGraph:
             "SELECT DISTINCT type FROM nodes WHERE type != 'kaybee' ORDER BY type"
         ).fetchall()
         result: dict[str, list[str]] = {}
-
-        if self._mode == "single":
-            for (t,) in types:
-                fields = self._db.execute(
-                    "SELECT field_name FROM _type_fields WHERE type_name = ? ORDER BY field_name",
-                    (t,),
-                ).fetchall()
-                result[t] = [r[0] for r in fields]
-            return result
-
         for (t,) in types:
-            safe = _safe_ident(t)
-            try:
-                cols = self._db.execute(f"PRAGMA table_info({safe})").fetchall()
-                keys = [c[1] for c in cols if c[1] not in ("name", "content")]
-                result[t] = keys
-            except sqlite3.OperationalError:
-                result[t] = []
+            fields = self._db.execute(
+                "SELECT field_name FROM _type_fields WHERE type_name = ? ORDER BY field_name",
+                (t,),
+            ).fetchall()
+            result[t] = [r[0] for r in fields]
         return result
 
     def graph(self) -> dict[str, list[str]]:

@@ -19,22 +19,22 @@ from kaybee.core import KnowledgeGraph, extract_wikilinks, parse_frontmatter, sl
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 
-@pytest.fixture(params=["multi", "single"])
-def kg(request):
-    return KnowledgeGraph(mode=request.param)
+@pytest.fixture
+def kg():
+    return KnowledgeGraph()
 
 
 @pytest.fixture(params=["multi", "single"])
 def kg_pair(request):
     """Two completely independent in-memory graphs."""
-    return KnowledgeGraph(mode=request.param), KnowledgeGraph(mode=request.param)
+    return KnowledgeGraph(), KnowledgeGraph()
 
 
 @pytest.fixture(params=["multi", "single"])
 def kg_file(tmp_path, request):
     """Graph backed by a real file."""
     path = str(tmp_path / "test.db")
-    return KnowledgeGraph(path, mode=request.param), path, request.param
+    return KnowledgeGraph(path, ), path, request.param
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -193,15 +193,9 @@ class TestReservedNames:
             kg.write("item", "---\ntype: nodes\n---\nbody")
 
     def test_type_named_select(self, kg):
-        if kg._mode == "single":
-            # In single mode, no per-type table is created, so SQL keyword types work
-            kg.write("item", "---\ntype: SELECT\n---\nbody")
-            assert kg.exists("item")
-        else:
-            # SQL keyword as type name — _safe_ident keeps it as "SELECT"
-            # which causes a CREATE TABLE SELECT (...) syntax error
-            with pytest.raises(sqlite3.OperationalError):
-                kg.write("item", "---\ntype: SELECT\n---\nbody")
+        # No per-type table is created, so SQL keyword types work
+        kg.write("item", "---\ntype: SELECT\n---\nbody")
+        assert kg.exists("item")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -638,34 +632,19 @@ class TestTypeSystemAbuse:
     def test_type_change_cleans_old_table(self, kg):
         """When a node changes type, it should be removed from the old type table."""
         kg.write("x", "---\ntype: alpha\nfield: val\n---\nbody")
-        if kg._mode == "single":
-            rows = kg.query("SELECT * FROM _data WHERE name = 'x'")
-            assert len(rows) == 1
-            kg.write("x", "---\ntype: beta\nfield: val\n---\nbody")
-            # In single mode, the row still exists but with new type in nodes
-            rows = kg.query("SELECT * FROM _data WHERE name = 'x'")
-            assert len(rows) == 1
-            assert kg.find_by_type("alpha") == []
-            assert kg.find_by_type("beta") == ["x"]
-        else:
-            rows = kg.query("SELECT * FROM alpha WHERE name = 'x'")
-            assert len(rows) == 1
-            kg.write("x", "---\ntype: beta\nfield: val\n---\nbody")
-            rows = kg.query("SELECT * FROM alpha WHERE name = 'x'")
-            assert len(rows) == 0
-            rows = kg.query("SELECT * FROM beta WHERE name = 'x'")
-            assert len(rows) == 1
+        rows = kg.query("SELECT * FROM _data WHERE name = 'x'")
+        assert len(rows) == 1
+        kg.write("x", "---\ntype: beta\nfield: val\n---\nbody")
+        # The row still exists but with new type in nodes
+        rows = kg.query("SELECT * FROM _data WHERE name = 'x'")
+        assert len(rows) == 1
+        assert kg.find_by_type("alpha") == []
+        assert kg.find_by_type("beta") == ["x"]
 
     def test_type_as_number_string(self, kg):
-        if kg._mode == "single":
-            # In single mode, no per-type table is created, so numeric types work
-            kg.write("item", "---\ntype: 42\n---\nbody")
-            assert kg.exists("item")
-        else:
-            # Numeric type names cause CREATE TABLE 42 (...) syntax error
-            # because _safe_ident("42") = "42" which is not a valid identifier
-            with pytest.raises(sqlite3.OperationalError):
-                kg.write("item", "---\ntype: 42\n---\nbody")
+        # No per-type table is created, so numeric types work
+        kg.write("item", "---\ntype: 42\n---\nbody")
+        assert kg.exists("item")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -781,69 +760,65 @@ class TestScaleStress:
 class TestPersistenceStress:
     """File-backed graph: open/close cycles, corruption resilience."""
 
-    @pytest.fixture(params=["multi", "single"])
-    def mode(self, request):
-        return request.param
-
-    def test_survives_reopen(self, tmp_path, mode):
+    def test_survives_reopen(self, tmp_path):
         path = str(tmp_path / "persist.db")
-        kg1 = KnowledgeGraph(path, mode=mode)
+        kg1 = KnowledgeGraph(path)
         kg1.write("node", "---\ntype: note\n---\nHello")
         kg1._db.close()
 
-        kg2 = KnowledgeGraph(path, mode=mode)
+        kg2 = KnowledgeGraph(path)
         assert kg2.exists("node")
         assert kg2.cat("node") == "---\ntype: note\n---\nHello"
         kg2._db.close()
 
-    def test_type_tables_survive_reopen(self, tmp_path, mode):
+    def test_type_tables_survive_reopen(self, tmp_path):
         path = str(tmp_path / "types.db")
-        kg1 = KnowledgeGraph(path, mode=mode)
+        kg1 = KnowledgeGraph(path)
         kg1.write("x", "---\ntype: concept\nfield: val\n---\nbody")
         kg1._db.close()
 
-        kg2 = KnowledgeGraph(path, mode=mode)
+        kg2 = KnowledgeGraph(path)
         assert kg2.find_by_type("concept") == ["x"]
         schema = kg2.schema()
         assert "concept" in schema
         kg2._db.close()
 
-    def test_links_survive_reopen(self, tmp_path, mode):
+    def test_links_survive_reopen(self, tmp_path):
         path = str(tmp_path / "links.db")
-        kg1 = KnowledgeGraph(path, mode=mode)
+        kg1 = KnowledgeGraph(path)
         kg1.touch("target", "exists")
         kg1.write("source", "See [[target]]")
         kg1._db.close()
 
-        kg2 = KnowledgeGraph(path, mode=mode)
+        kg2 = KnowledgeGraph(path)
         assert kg2.wikilinks("source") == ["target"]
         assert "source" in kg2.backlinks("target")
         kg2._db.close()
 
-    def test_many_open_close_cycles(self, tmp_path, mode):
+    def test_many_open_close_cycles(self, tmp_path):
         path = str(tmp_path / "cycles.db")
         for i in range(20):
-            kg = KnowledgeGraph(path, mode=mode)
+            kg = KnowledgeGraph(path)
             kg.touch(f"node-{i}", f"cycle-{i}")
             kg._db.close()
 
-        final = KnowledgeGraph(path, mode=mode)
+        final = KnowledgeGraph(path)
         for i in range(20):
             assert final.exists(f"node-{i}")
             assert final.cat(f"node-{i}") == f"cycle-{i}"
         final._db.close()
 
-    def test_concurrent_mutations_across_reopens(self, tmp_path, mode):
+    def test_concurrent_mutations_across_reopens(self, tmp_path):
         path = str(tmp_path / "mutate.db")
-        kg = KnowledgeGraph(path, mode=mode)
+        kg = KnowledgeGraph(path)
         kg.write("evolving", "---\ntype: v1\n---\nfirst")
         kg._db.close()
 
-        kg = KnowledgeGraph(path, mode=mode)
+        kg = KnowledgeGraph(path)
         kg.write("evolving", "---\ntype: v2\nfield: new\n---\nsecond")
         kg._db.close()
 
-        kg = KnowledgeGraph(path, mode=mode)
+        kg = KnowledgeGraph(path)
         assert kg.frontmatter("evolving")["type"] == "v2"
         assert kg.body("evolving") == "second"
         kg._db.close()
@@ -873,7 +848,7 @@ class TestQueryAbuse:
 
     def test_query_with_params(self, kg):
         kg.touch("target", "data")
-        t = kg.data_table()
+        t = "_data"
         rows = kg.query(f"SELECT content FROM {t} WHERE name = ?", ("target",))
         assert rows[0][0] == "data"
 

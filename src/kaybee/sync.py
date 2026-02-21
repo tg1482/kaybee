@@ -333,23 +333,15 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
         local_cols = [c for c in mysql_cols if c not in scope_keys]
         local_idxs = [mysql_cols.index(c) for c in local_cols]
 
-        # Route to the correct local table (handles multi/single)
-        local_table = kg.data_table(type_name)
+        # Ensure _data has all columns
+        existing_local = set(_local_table_columns(kg, "_data"))
+        for col in local_cols:
+            if col not in existing_local:
+                kg.query(f"ALTER TABLE _data ADD COLUMN `{col}` TEXT")
+                existing_local.add(col)
 
-        # Ensure local table exists and has all columns
-        existing_local = set(_local_table_columns(kg, local_table))
-        if not existing_local:
-            col_defs = ", ".join(f"`{c}` TEXT" for c in local_cols)
-            kg.query(f"CREATE TABLE IF NOT EXISTS `{local_table}` ({col_defs})")
-            existing_local = set(local_cols)
-        else:
-            for col in local_cols:
-                if col not in existing_local:
-                    safe_col = col.replace('"', '""')
-                    kg.query(f'ALTER TABLE `{local_table}` ADD COLUMN `{safe_col}` TEXT')
-
-        # In single mode, register type-specific fields in _type_fields
-        if local_table == "_data" and type_name != "kaybee":
+        # Register type-specific fields in _type_fields
+        if type_name != "kaybee":
             for col in local_cols:
                 if col not in ("name", "content"):
                     kg.query(
@@ -363,7 +355,7 @@ def sync_pull(kg, mysql_conn, scope: dict) -> int:
         for row in rows:
             vals = tuple(row[i] for i in local_idxs)
             kg.query(
-                f"INSERT OR REPLACE INTO `{local_table}` ({col_str}) VALUES ({placeholders})",
+                f"INSERT OR REPLACE INTO _data ({col_str}) VALUES ({placeholders})",
                 vals,
             )
             total += 1

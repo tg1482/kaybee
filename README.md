@@ -26,46 +26,13 @@ born: 1912
 Pioneered computation and [[agent-traversal]].""")
 ```
 
-That's it. `concept` and `person` tables now exist. Links are tracked. Backlinks resolve automatically.
+That's it. Types are tracked, links are resolved, backlinks work automatically.
 
-## Storage modes
-
-kaybee has two storage layouts. The API is identical — only the internal SQL changes.
-
-### Multi mode (default)
+Internally, all node data lives in a single `_data` table. A `_type_fields` table tracks which columns belong to which type. The `nodes` table is a thin index of name + type.
 
 ```python
-kg = KnowledgeGraph("brain.db")  # or mode="multi"
-```
-
-One SQL table per type: `concept`, `person`, `kaybee` (for untyped nodes). Each table has columns matching that type's frontmatter fields. Good for inspecting types independently.
-
-### Single mode
-
-```python
-kg = KnowledgeGraph("brain.db", mode="single")
-```
-
-One unified `_data` table for all nodes. Columns are the union of all types' fields — rows have NULLs for fields that don't belong to their type. A `_type_fields` table tracks which fields belong to which type. Good for cross-type queries.
-
-The mode is locked into the database file on first use. Reopening with the wrong mode raises `ValueError`.
-
-### What changes between modes
-
-The write path is the same in both modes: parse frontmatter, update the `nodes` index, upsert data, sync wikilinks. The difference is where data lands.
-
-| Operation | Multi | Single |
-|---|---|---|
-| Write typed node | Row in `concept` table | Row in `_data` table |
-| Write untyped node | Row in `kaybee` table | Row in `_data` table |
-| Change type (concept → note) | Delete from `concept`, insert into `note` | Update in place in `_data` |
-| Schema tracking | `PRAGMA table_info(concept)` | `_type_fields` table |
-| Cross-type query | `UNION ALL` across tables | Single `SELECT` on `_data` |
-
-```python
-# Use data_table() to get the right table name for raw SQL
-table = kg.data_table("concept")  # "concept" in multi, "_data" in single
-kg.query(f"SELECT name, description FROM {table}")
+# Raw SQL is available when you need it
+kg.query("SELECT name, description FROM _data WHERE name = ?", ("spreading-activation",))
 ```
 
 ## Core operations

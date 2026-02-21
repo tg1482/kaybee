@@ -1,20 +1,24 @@
-"""Shared fixtures for KnowledgeGraph tests."""
-
 import pytest
-
 from kaybee.core import KnowledgeGraph
 
 
-@pytest.fixture(params=["multi", "single"])
-def kg(request):
-    """Fresh in-memory KnowledgeGraph."""
-    return KnowledgeGraph(mode=request.param)
+@pytest.fixture
+def kg():
+    return KnowledgeGraph()
 
 
-@pytest.fixture(params=["multi", "single"])
-def populated_kg(request):
+@pytest.fixture
+def kg_with_types():
+    kg = KnowledgeGraph()
+    kg.add_type("concept")
+    kg.add_type("person")
+    return kg
+
+
+@pytest.fixture
+def populated_kg():
     """KnowledgeGraph pre-loaded with a small knowledge base."""
-    kg = KnowledgeGraph(mode=request.param)
+    kg = KnowledgeGraph()
     kg.add_type("concept")
     kg.add_type("person")
 

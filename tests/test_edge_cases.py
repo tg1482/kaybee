@@ -121,7 +121,7 @@ class TestRmGraphCleanup:
     def test_rm_cleans_type(self, kg):
         kg.write("item", "---\ntype: concept\n---\nBody.")
         kg.rm("item")
-        t = kg.data_table("concept")
+        t = "_data"
         assert kg.query(f"SELECT * FROM {t} WHERE name = 'item'") == []
 
     def test_rm_cleans_links(self, kg):

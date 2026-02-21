@@ -33,9 +33,9 @@ from kaybee.shell import (
 )
 
 
-@pytest.fixture(params=["multi", "single"])
-def graph_kg(request):
-    kg = KnowledgeGraph(mode=request.param)
+@pytest.fixture
+def graph_kg():
+    kg = KnowledgeGraph()
     kg.add_type("concept")
     kg.write(
         "sa",
@@ -138,7 +138,7 @@ class TestCmdSchema:
 
 class TestCmdQuery:
     def test_basic(self, graph_kg):
-        t = graph_kg.data_table("concept")
+        t = "_data"
         result = _cmd_query(["SELECT", "name", "FROM", t], "", graph_kg)
         assert "sa" in result
         assert "at" in result

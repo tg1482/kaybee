@@ -46,14 +46,14 @@ class TestInfo:
 class TestQuery:
     def test_basic(self, kg):
         kg.touch("file", "hello")
-        t = kg.data_table()
+        t = "_data"
         rows = kg.query(f"SELECT name, content FROM {t} WHERE name = 'file'")
         assert rows == [("file", "hello")]
 
     def test_with_params(self, kg):
         kg.touch("a", "x")
         kg.touch("b", "y")
-        t = kg.data_table()
+        t = "_data"
         rows = kg.query(f"SELECT name FROM {t} WHERE content = ?", ("x",))
         assert rows == [("a",)]
 
