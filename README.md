@@ -67,6 +67,46 @@ kg.schema()                  # {type: [fields]} across all types
 kg.query("SELECT name FROM nodes WHERE type = ?", ("concept",))
 ```
 
+## Changelog
+
+Every mutation is recorded in an append-only changelog (enabled by default). This drives delta sync and audit trails.
+
+```python
+kg = KnowledgeGraph("brain.db")  # changelog=True by default
+
+kg.write("sa", "---\ntype: concept\n---\nSpreading activation.")
+kg.rm("sa")
+
+entries = kg.changelog(since_seq=0, limit=100)
+# [(1, '2026-...', 'node.write', 'sa', '{"type": "concept", ...}'),
+#  (2, '2026-...', 'node.rm',    'sa', '{"type": "concept"}')]
+
+kg.changelog_truncate(before_seq=2)  # prune old entries
+```
+
+Operations logged: `node.write`, `node.rm`, `node.mv`, `node.cp`, `node.type_change`, `type.add`, `type.rm`.
+
+Disable with `KnowledgeGraph("brain.db", changelog=False)` if you don't need it.
+
+## Sync
+
+Push local changes to a remote MySQL database, scoped by team/user/project. Pull to replicate back.
+
+```python
+from kaybee import sync_push, sync_pull
+
+# Push changelog deltas to MySQL (only changed rows sent)
+last_seq = sync_push(kg, mysql_conn, scope={"team_id": "eng"}, since_seq=0)
+# Persist last_seq for next call
+
+# Pull all rows matching scope from MySQL into local SQLite
+count = sync_pull(kg, mysql_conn, scope={"team_id": "eng"})
+```
+
+- **Push** replays changelog entries — upserts and deletes flow through, including type changes and renames.
+- **Pull** is a full pull filtered by scope. Writes bypass the changelog to avoid push-back loops.
+- Falls back to full-table-scan push when changelog is disabled (deletes not propagated in this mode).
+
 ## Constraints
 
 Free-form by default. Add structure when you want it.
