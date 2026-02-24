@@ -49,6 +49,18 @@ class TestBatchCrossReferences:
         links = kg.links("source")
         assert any(resolved == "target" for _, resolved in links)
 
+    def test_batch_resolves_pre_existing_dangling_links(self):
+        kg = KnowledgeGraph()
+        # Create a node with a dangling link
+        kg.write("source", "See [[future-node]].")
+        rows = kg.query("SELECT target_resolved FROM _links WHERE source_name = 'source'")
+        assert rows[0][0] is None  # dangling
+        # Batch creates the target — should resolve the dangling link
+        with kg.batch() as b:
+            b.write("future-node", "Now I exist.")
+        rows = kg.query("SELECT target_resolved FROM _links WHERE source_name = 'source'")
+        assert rows[0][0] == "future-node"
+
 
 class TestBatchAtomicity:
     def test_exception_rolls_back(self):
@@ -74,6 +86,18 @@ class TestBatchAtomicity:
         # Neither should be persisted since validation failed eagerly
         assert not kg.exists("good")
         assert not kg.exists("bad")
+
+    def test_internal_error_rolls_back(self):
+        """A reserved type name triggers an error during persist, rolling back."""
+        kg = KnowledgeGraph()
+        kg.write("existing", "should survive")
+        with pytest.raises(ValueError, match="Reserved type name"):
+            with kg.batch() as b:
+                b.write("ok-node", "fine content")
+                b.write("bad-node", "---\ntype: _links\n---\nReserved type.")
+        assert not kg.exists("ok-node")
+        assert not kg.exists("bad-node")
+        assert kg.exists("existing")  # pre-existing data intact
 
 
 class TestBatchDuplicates:

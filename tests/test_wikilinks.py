@@ -206,26 +206,31 @@ class TestMvCpGraph:
 
 class TestSlugIndex:
     def test_slug_populated_on_write(self, kg):
-        kg.write("hello-world", "content")
+        kg.write("Hello World", "content")
         rows = kg.query("SELECT slug FROM nodes WHERE name = 'hello-world'")
         assert rows[0][0] == "hello-world"
 
+    def test_slug_matches_name_for_already_slugified(self, kg):
+        kg.write("simple", "content")
+        rows = kg.query("SELECT name, slug FROM nodes WHERE name = 'simple'")
+        assert rows[0][0] == rows[0][1]
+
     def test_slug_populated_on_touch(self, kg):
-        kg.touch("my-node")
+        kg.touch("My Node")
         rows = kg.query("SELECT slug FROM nodes WHERE name = 'my-node'")
         assert rows[0][0] == "my-node"
 
     def test_slug_populated_on_mv(self, kg):
         kg.touch("old-name", "content")
-        kg.mv("old-name", "new-name")
+        kg.mv("old-name", "New Name")
         rows = kg.query("SELECT slug FROM nodes WHERE name = 'new-name'")
         assert rows[0][0] == "new-name"
 
     def test_slug_populated_on_cp(self, kg):
         kg.touch("original", "content")
-        kg.cp("original", "copy")
-        rows = kg.query("SELECT slug FROM nodes WHERE name = 'copy'")
-        assert rows[0][0] == "copy"
+        kg.cp("original", "Copy Node")
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'copy-node'")
+        assert rows[0][0] == "copy-node"
 
     def test_resolve_uses_slug_index(self, kg):
         kg.touch("agent-traversal", "content")

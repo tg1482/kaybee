@@ -76,12 +76,13 @@ def make_document(name: str, text: str) -> Document:
     """
     slug_name = slugify(name)
     meta, body = parse_frontmatter(text)
-    effective_type = meta.pop("type", None) or "kaybee"
+    effective_type = meta.get("type") or "kaybee"
+    clean_meta = {k: v for k, v in meta.items() if k != "type"}
     refs = extract_wikilinks(body)
     return Document(
         name=slug_name,
         type=effective_type,
-        meta=meta,
+        meta=clean_meta,
         body=body,
         raw=text,
         refs=refs,
@@ -479,10 +480,9 @@ class KnowledgeGraph:
     # Internal: link management
     # ------------------------------------------------------------------
 
-    def _sync_links(self, name: str, body: str) -> None:
+    def _sync_links(self, name: str, refs: list[str], body: str) -> None:
         self._db.execute("DELETE FROM _links WHERE source_name = ?", (name,))
-        targets = extract_wikilinks(body)
-        for target in targets:
+        for target in refs:
             resolved = self.resolve_wikilink(target, fuzzy=True)
             ctx = ""
             for line in body.splitlines():
@@ -495,7 +495,6 @@ class KnowledgeGraph:
             )
 
     def _re_resolve_links_to(self, name: str) -> None:
-        slug = slugify(name)
         rows = self._db.execute(
             "SELECT source_name, target_name FROM _links WHERE target_resolved IS NULL OR target_resolved = ?",
             (name,),
@@ -524,47 +523,55 @@ class KnowledgeGraph:
         if violations:
             raise ValidationError(violations)
 
+    def _get_old_type(self, name: str) -> str | None:
+        """Return the current type of a node, or None if it doesn't exist."""
+        old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
+        return old[0] if old else None
+
+    def _upsert_doc(self, doc: Document, old_type: str | None) -> None:
+        """Upsert a Document's data and index row (must be inside a transaction)."""
+        meta_with_type = {**doc.meta, "type": doc.type}
+        type_changed = old_type is not None and old_type != doc.type
+
+        if type_changed:
+            self._delete_data_row(old_type, doc.name)
+
+        # Store data BEFORE updating the index so a crash never leaves
+        # the nodes table pointing at a missing data row.
+        self._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
+
+        self._db.execute(
+            "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (doc.name, doc.type, doc.name),
+        )
+
+        if doc.type != "kaybee":
+            self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
+
+    def _log_doc(self, doc: Document, old_type: str | None) -> None:
+        """Write a changelog entry for a Document (must be inside a transaction)."""
+        meta_with_type = {**doc.meta, "type": doc.type}
+        type_changed = old_type is not None and old_type != doc.type
+
+        if type_changed:
+            self._log("node.type_change", doc.name, {
+                "old_type": old_type,
+                "type": doc.type,
+                "content": doc.body,
+                "meta": meta_with_type,
+            })
+        else:
+            self._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
+
     def _persist_doc(self, doc: Document) -> None:
         """Persist a validated Document inside a transaction."""
-        meta_with_type = {**doc.meta, "type": doc.type}
-
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (doc.name,)).fetchone()
-            old_type = old[0] if old else None
-            type_changed = old_type is not None and old_type != doc.type
-
-            # Handle type change: delete from old type table
-            if type_changed:
-                self._delete_data_row(old_type, doc.name)
-
-            # Store data BEFORE updating the index so a crash never leaves
-            # the nodes table pointing at a missing data row.
-            self._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
-
-            # Thin index: name + type + slug
-            self._db.execute(
-                "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
-                (doc.name, doc.type, slugify(doc.name)),
-            )
-
-            # Auto-register typed nodes in _types (not kaybee)
-            if doc.type != "kaybee":
-                self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
-
-            self._sync_links(doc.name, doc.body)
+            old_type = self._get_old_type(doc.name)
+            self._upsert_doc(doc, old_type)
+            self._sync_links(doc.name, doc.refs, doc.body)
             self._re_resolve_links_to(doc.name)
-
-            if type_changed:
-                self._log("node.type_change", doc.name, {
-                    "old_type": old_type,
-                    "type": doc.type,
-                    "content": doc.body,
-                    "meta": meta_with_type,
-                })
-            else:
-                self._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
-
+            self._log_doc(doc, old_type)
             self._db.commit()
         except BaseException:
             self._db.rollback()
@@ -584,6 +591,41 @@ class KnowledgeGraph:
         doc = make_document(name, content)
         self._validate_doc(doc)
         return doc
+
+    def _persist_batch(self, docs: list[Document]) -> None:
+        """Persist a list of validated Documents in a single transaction.
+
+        Uses deferred link resolution so cross-references within the batch
+        resolve correctly.
+        """
+        if not docs:
+            return
+
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            # Record old types before any mutations for changelog
+            old_types = {doc.name: self._get_old_type(doc.name) for doc in docs}
+
+            # Phase 1: Persist all documents (upsert data + update index)
+            for doc in docs:
+                self._upsert_doc(doc, old_types[doc.name])
+
+            # Phase 2: Sync links for all documents
+            for doc in docs:
+                self._sync_links(doc.name, doc.refs, doc.body)
+
+            # Phase 3: Re-resolve backlinks for all written names
+            for doc in docs:
+                self._re_resolve_links_to(doc.name)
+
+            # Phase 4: Log changelog entries
+            for doc in docs:
+                self._log_doc(doc, old_types[doc.name])
+
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
 
     def batch(self) -> "_BatchContext":
         """Return a context manager for batched writes.
@@ -787,7 +829,7 @@ class KnowledgeGraph:
         )
         self._upsert_type_row(type_name, dst, content, meta)
 
-        self._sync_links(dst, content)
+        self._sync_links(dst, extract_wikilinks(content), content)
         self._log("node.cp", dst, {"source": src, "type": type_name, "content": content, "meta": meta})
         self._db.commit()
         return self
@@ -1132,68 +1174,13 @@ class _BatchContext:
         if not self._docs:
             return  # empty batch — no-op
 
-        # Deduplicate: last write wins for same node name
+        # Deduplicate: last write wins for same node name, preserve order
         seen: dict[str, int] = {}
         for i, doc in enumerate(self._docs):
             seen[doc.name] = i
         docs = [self._docs[i] for i in sorted(seen.values())]
 
-        kg = self._kg
-        kg._db.execute("BEGIN IMMEDIATE")
-        try:
-            # Record old types before any mutations for changelog
-            old_types: dict[str, str | None] = {}
-            for doc in docs:
-                old = kg._db.execute("SELECT type FROM nodes WHERE name = ?", (doc.name,)).fetchone()
-                old_types[doc.name] = old[0] if old else None
-
-            # Phase 1: Persist all documents (upsert data + update index)
-            for doc in docs:
-                meta_with_type = {**doc.meta, "type": doc.type}
-                old_type = old_types[doc.name]
-                type_changed = old_type is not None and old_type != doc.type
-
-                if type_changed:
-                    kg._delete_data_row(old_type, doc.name)
-
-                kg._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
-
-                kg._db.execute(
-                    "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
-                    (doc.name, doc.type, slugify(doc.name)),
-                )
-
-                if doc.type != "kaybee":
-                    kg._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
-
-            # Phase 2: Sync links for all documents
-            for doc in docs:
-                kg._sync_links(doc.name, doc.body)
-
-            # Phase 3: Re-resolve backlinks for all written names
-            for doc in docs:
-                kg._re_resolve_links_to(doc.name)
-
-            # Phase 4: Log changelog entries
-            for doc in docs:
-                meta_with_type = {**doc.meta, "type": doc.type}
-                old_type = old_types[doc.name]
-                type_changed = old_type is not None and old_type != doc.type
-
-                if type_changed:
-                    kg._log("node.type_change", doc.name, {
-                        "old_type": old_type,
-                        "type": doc.type,
-                        "content": doc.body,
-                        "meta": meta_with_type,
-                    })
-                else:
-                    kg._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
-
-            kg._db.commit()
-        except BaseException:
-            kg._db.rollback()
-            raise
+        self._kg._persist_batch(docs)
 
 
 # ---------------------------------------------------------------------------

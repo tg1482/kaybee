@@ -107,6 +107,17 @@ class TestMakeDocumentSlugify:
         assert doc.name == slugify("My Note (v2)")
 
 
+class TestMakeDocumentPurity:
+    def test_does_not_mutate_parse_frontmatter_output(self):
+        """make_document must not pop/mutate the dict from parse_frontmatter."""
+        from kaybee.core import parse_frontmatter
+        text = "---\ntype: concept\ntags: [a]\n---\nBody."
+        meta, _ = parse_frontmatter(text)
+        assert "type" in meta  # before
+        make_document("node", text)
+        assert "type" in meta  # after — must still be there
+
+
 class TestMakeDocumentEdgeCases:
     def test_unicode_body(self):
         text = "---\ntype: concept\n---\nCafé résumé naïve"
