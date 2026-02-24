@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -52,6 +53,40 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 def extract_wikilinks(text: str) -> list[str]:
     """Extract all ``[[wikilink]]`` targets from *text*."""
     return _WIKILINK_RE.findall(text)
+
+
+@dataclass
+class Document:
+    """Structured intermediate representation of a parsed node."""
+
+    name: str
+    type: str
+    meta: dict = field(default_factory=dict)
+    body: str = ""
+    raw: str = ""
+    refs: list[str] = field(default_factory=list)
+
+
+def make_document(name: str, text: str) -> Document:
+    """Parse *text* into a :class:`Document`.
+
+    This is a pure function that combines ``slugify``, ``parse_frontmatter``,
+    and ``extract_wikilinks`` into a single step, producing a structured
+    intermediate representation suitable for validation and persistence.
+    """
+    slug_name = slugify(name)
+    meta, body = parse_frontmatter(text)
+    effective_type = meta.get("type") or "kaybee"
+    clean_meta = {k: v for k, v in meta.items() if k != "type"}
+    refs = extract_wikilinks(body)
+    return Document(
+        name=slug_name,
+        type=effective_type,
+        meta=clean_meta,
+        body=body,
+        raw=text,
+        refs=refs,
+    )
 
 
 def _parse_yaml_subset(yaml_str: str) -> dict[str, Any]:
@@ -218,7 +253,8 @@ _RESERVED_TYPE_NAMES = frozenset({"nodes", "_types", "_links", "_changelog", "_d
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
     name    TEXT PRIMARY KEY,
-    type    TEXT NOT NULL DEFAULT 'kaybee'
+    type    TEXT NOT NULL DEFAULT 'kaybee',
+    slug    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
@@ -269,6 +305,7 @@ class KnowledgeGraph:
 
     def _init_schema(self) -> None:
         self._db.executescript(_SCHEMA_SQL)
+        self._migrate_slug_column()
         if self._changelog:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS _changelog ("
@@ -278,6 +315,17 @@ class KnowledgeGraph:
                 "name TEXT NOT NULL, "
                 "data TEXT)"
             )
+        self._db.commit()
+
+    def _migrate_slug_column(self) -> None:
+        """Add slug column to nodes table if missing and ensure index exists."""
+        cols = {row[1] for row in self._db.execute("PRAGMA table_info(nodes)").fetchall()}
+        if "slug" not in cols:
+            self._db.execute("ALTER TABLE nodes ADD COLUMN slug TEXT")
+            rows = self._db.execute("SELECT name FROM nodes").fetchall()
+            for (name,) in rows:
+                self._db.execute("UPDATE nodes SET slug = ? WHERE name = ?", (slugify(name), name))
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_slug ON nodes(slug)")
         self._db.commit()
 
     def _log(self, op: str, name: str, data: dict | None = None) -> None:
@@ -432,10 +480,9 @@ class KnowledgeGraph:
     # Internal: link management
     # ------------------------------------------------------------------
 
-    def _sync_links(self, name: str, body: str) -> None:
+    def _sync_links(self, name: str, refs: list[str], body: str) -> None:
         self._db.execute("DELETE FROM _links WHERE source_name = ?", (name,))
-        targets = extract_wikilinks(body)
-        for target in targets:
+        for target in refs:
             resolved = self.resolve_wikilink(target, fuzzy=True)
             ctx = ""
             for line in body.splitlines():
@@ -448,7 +495,6 @@ class KnowledgeGraph:
             )
 
     def _re_resolve_links_to(self, name: str) -> None:
-        slug = slugify(name)
         rows = self._db.execute(
             "SELECT source_name, target_name FROM _links WHERE target_resolved IS NULL OR target_resolved = ?",
             (name,),
@@ -461,61 +507,140 @@ class KnowledgeGraph:
             )
 
     # ------------------------------------------------------------------
-    # Internal: node write helper
+    # Internal: node write helpers (parse → validate → persist)
     # ------------------------------------------------------------------
 
-    def _write_node(self, name: str, content: str) -> None:
-        meta, body = parse_frontmatter(content)
-        effective_type = meta.get("type") or "kaybee"
+    def _validate_doc(self, doc: Document) -> None:
+        """Run structural validator if attached.
 
-        # Pre-write validator check (structural rules only)
-        if self._validator is not None:
-            from .constraints import ValidationError
-            violations = self._validator.validate_structural(name, meta)
-            if violations:
-                raise ValidationError(violations)
+        Reconstructs meta with ``type`` key for validator compatibility.
+        """
+        if self._validator is None:
+            return
+        from .constraints import ValidationError
+        meta_with_type = {**doc.meta, "type": doc.type}
+        violations = self._validator.validate_structural(doc.name, meta_with_type)
+        if violations:
+            raise ValidationError(violations)
+
+    def _get_old_type(self, name: str) -> str | None:
+        """Return the current type of a node, or None if it doesn't exist."""
+        old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
+        return old[0] if old else None
+
+    def _upsert_doc(self, doc: Document, old_type: str | None) -> None:
+        """Upsert a Document's data and index row (must be inside a transaction)."""
+        meta_with_type = {**doc.meta, "type": doc.type}
+        type_changed = old_type is not None and old_type != doc.type
+
+        if type_changed:
+            self._delete_data_row(old_type, doc.name)
+
+        # Store data BEFORE updating the index so a crash never leaves
+        # the nodes table pointing at a missing data row.
+        self._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
+
+        self._db.execute(
+            "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (doc.name, doc.type, doc.name),
+        )
+
+        if doc.type != "kaybee":
+            self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
+
+    def _log_doc(self, doc: Document, old_type: str | None) -> None:
+        """Write a changelog entry for a Document (must be inside a transaction)."""
+        meta_with_type = {**doc.meta, "type": doc.type}
+        type_changed = old_type is not None and old_type != doc.type
+
+        if type_changed:
+            self._log("node.type_change", doc.name, {
+                "old_type": old_type,
+                "type": doc.type,
+                "content": doc.body,
+                "meta": meta_with_type,
+            })
+        else:
+            self._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
+
+    def _persist_doc(self, doc: Document) -> None:
+        """Persist a validated Document inside a transaction."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            old_type = self._get_old_type(doc.name)
+            self._upsert_doc(doc, old_type)
+            self._sync_links(doc.name, doc.refs, doc.body)
+            self._re_resolve_links_to(doc.name)
+            self._log_doc(doc, old_type)
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
+
+    def _write_node(self, name: str, content: str) -> None:
+        doc = make_document(name, content)
+        self._validate_doc(doc)
+        self._persist_doc(doc)
+
+    def dry_write(self, name: str, content: str) -> Document:
+        """Parse and validate without persisting.
+
+        Returns the :class:`Document` that *would* be written.
+        Raises :class:`~kaybee.constraints.ValidationError` on failure.
+        """
+        doc = make_document(name, content)
+        self._validate_doc(doc)
+        return doc
+
+    def _persist_batch(self, docs: list[Document]) -> None:
+        """Persist a list of validated Documents in a single transaction.
+
+        Uses deferred link resolution so cross-references within the batch
+        resolve correctly.
+        """
+        if not docs:
+            return
 
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
-            old_type = old[0] if old else None
-            type_changed = old_type is not None and old_type != effective_type
+            # Record old types before any mutations for changelog
+            old_types = {doc.name: self._get_old_type(doc.name) for doc in docs}
 
-            # Handle type change: delete from old type table
-            if type_changed:
-                self._delete_data_row(old_type, name)
+            # Phase 1: Persist all documents (upsert data + update index)
+            for doc in docs:
+                self._upsert_doc(doc, old_types[doc.name])
 
-            # Store data BEFORE updating the index so a crash never leaves
-            # the nodes table pointing at a missing data row.
-            self._upsert_type_row(effective_type, name, body, meta)
+            # Phase 2: Sync links for all documents
+            for doc in docs:
+                self._sync_links(doc.name, doc.refs, doc.body)
 
-            # Thin index: name + type only
-            self._db.execute(
-                "INSERT OR REPLACE INTO nodes (name, type) VALUES (?, ?)",
-                (name, effective_type),
-            )
+            # Phase 3: Re-resolve backlinks for all written names
+            for doc in docs:
+                self._re_resolve_links_to(doc.name)
 
-            # Auto-register typed nodes in _types (not kaybee)
-            if effective_type != "kaybee":
-                self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (effective_type,))
-
-            self._sync_links(name, body)
-            self._re_resolve_links_to(name)
-
-            if type_changed:
-                self._log("node.type_change", name, {
-                    "old_type": old_type,
-                    "type": effective_type,
-                    "content": body,
-                    "meta": meta,
-                })
-            else:
-                self._log("node.write", name, {"type": effective_type, "content": body, "meta": meta})
+            # Phase 4: Log changelog entries
+            for doc in docs:
+                self._log_doc(doc, old_types[doc.name])
 
             self._db.commit()
         except BaseException:
             self._db.rollback()
             raise
+
+    def batch(self) -> "_BatchContext":
+        """Return a context manager for batched writes.
+
+        Usage::
+
+            with kg.batch() as b:
+                b.write("node-1", content1)
+                b.write("node-2", content2)
+
+        All writes are parsed and validated eagerly (fail-fast).  Persistence
+        happens in a single transaction on ``__exit__`` with deferred link
+        resolution so cross-references within the batch resolve correctly.
+        """
+        return _BatchContext(self)
 
     # ------------------------------------------------------------------
     # Type management
@@ -588,8 +713,8 @@ class KnowledgeGraph:
             self._write_node(name, content)
         else:
             self._db.execute(
-                "INSERT OR IGNORE INTO nodes (name, type) VALUES (?, 'kaybee')",
-                (name,),
+                "INSERT OR IGNORE INTO nodes (name, type, slug) VALUES (?, 'kaybee', ?)",
+                (name, slugify(name)),
             )
             self._upsert_type_row("kaybee", name, "", {})
             self._log("node.write", name, {"type": "kaybee", "content": "", "meta": {}})
@@ -666,8 +791,8 @@ class KnowledgeGraph:
 
         # Insert new into index and type table
         self._db.execute(
-            "INSERT INTO nodes (name, type) VALUES (?, ?)",
-            (new_name, type_name),
+            "INSERT INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (new_name, type_name, slugify(new_name)),
         )
         # meta from _read_node_data includes 'type' for typed nodes; pass as-is
         self._upsert_type_row(type_name, new_name, content, meta)
@@ -699,12 +824,12 @@ class KnowledgeGraph:
         type_name = meta.get("type", "kaybee")
 
         self._db.execute(
-            "INSERT INTO nodes (name, type) VALUES (?, ?)",
-            (dst, type_name),
+            "INSERT INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (dst, type_name, slugify(dst)),
         )
         self._upsert_type_row(type_name, dst, content, meta)
 
-        self._sync_links(dst, content)
+        self._sync_links(dst, extract_wikilinks(content), content)
         self._log("node.cp", dst, {"source": src, "type": type_name, "content": content, "meta": meta})
         self._db.commit()
         return self
@@ -877,7 +1002,7 @@ class KnowledgeGraph:
     def resolve_wikilink(self, name: str, fuzzy: bool = True) -> str | None:
         """Resolve a wikilink name to a node name.
 
-        Exact match first, then fuzzy via slugify.
+        Exact match first, then fuzzy via indexed slug lookup.
         """
         row = self._db.execute(
             "SELECT name FROM nodes WHERE name = ?", (name,)
@@ -888,12 +1013,10 @@ class KnowledgeGraph:
         if not fuzzy:
             return None
 
-        target_slug = slugify(name)
-        rows = self._db.execute("SELECT name FROM nodes").fetchall()
-        for (rname,) in rows:
-            if slugify(rname) == target_slug:
-                return rname
-        return None
+        row = self._db.execute(
+            "SELECT name FROM nodes WHERE slug = ?", (slugify(name),)
+        ).fetchone()
+        return row[0] if row else None
 
     def backlinks(self, name: str) -> list[str]:
         rows = self._db.execute(
@@ -1020,6 +1143,44 @@ class KnowledgeGraph:
         return self._db.execute(sql, params).fetchall()
 
     # ------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Batch context
+# ---------------------------------------------------------------------------
+
+class _BatchContext:
+    """Accumulates writes and persists them in a single transaction.
+
+    Created via :meth:`KnowledgeGraph.batch`.
+    """
+
+    def __init__(self, kg: KnowledgeGraph) -> None:
+        self._kg = kg
+        self._docs: list[Document] = []
+
+    def __enter__(self) -> "_BatchContext":
+        return self
+
+    def write(self, name: str, content: str) -> None:
+        """Parse and validate immediately (fail-fast), queue for persistence."""
+        doc = make_document(name, content)
+        self._kg._validate_doc(doc)
+        self._docs.append(doc)
+
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+        if exc_type is not None:
+            return  # user code raised — don't persist
+        if not self._docs:
+            return  # empty batch — no-op
+
+        # Deduplicate: last write wins for same node name, preserve order
+        seen: dict[str, int] = {}
+        for i, doc in enumerate(self._docs):
+            seen[doc.name] = i
+        docs = [self._docs[i] for i in sorted(seen.values())]
+
+        self._kg._persist_batch(docs)
 
 
 # ---------------------------------------------------------------------------

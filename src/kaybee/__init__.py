@@ -11,7 +11,7 @@ Usage:
     kg.wikilinks("hello")  # -> []
 """
 
-from .core import KnowledgeGraph, extract_wikilinks, parse_frontmatter, slugify
+from .core import KnowledgeGraph, Document, extract_wikilinks, make_document, parse_frontmatter, slugify
 from .sync import sync_push, sync_pull
 from .shell import GraphShell, register_graph_commands, GRAPH_COMMANDS, GRAPH_HELP
 from .viz import build_viz_data, visualize
@@ -30,7 +30,9 @@ from .constraints import (
 __version__ = "0.1.0"
 __all__ = [
     "KnowledgeGraph",
+    "Document",
     "extract_wikilinks",
+    "make_document",
     "parse_frontmatter",
     "slugify",
     "GraphShell",
