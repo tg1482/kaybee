@@ -585,6 +585,21 @@ class KnowledgeGraph:
         self._validate_doc(doc)
         return doc
 
+    def batch(self) -> "_BatchContext":
+        """Return a context manager for batched writes.
+
+        Usage::
+
+            with kg.batch() as b:
+                b.write("node-1", content1)
+                b.write("node-2", content2)
+
+        All writes are parsed and validated eagerly (fail-fast).  Persistence
+        happens in a single transaction on ``__exit__`` with deferred link
+        resolution so cross-references within the batch resolve correctly.
+        """
+        return _BatchContext(self)
+
     # ------------------------------------------------------------------
     # Type management
     # ------------------------------------------------------------------
@@ -1086,6 +1101,99 @@ class KnowledgeGraph:
         return self._db.execute(sql, params).fetchall()
 
     # ------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Batch context
+# ---------------------------------------------------------------------------
+
+class _BatchContext:
+    """Accumulates writes and persists them in a single transaction.
+
+    Created via :meth:`KnowledgeGraph.batch`.
+    """
+
+    def __init__(self, kg: KnowledgeGraph) -> None:
+        self._kg = kg
+        self._docs: list[Document] = []
+
+    def __enter__(self) -> "_BatchContext":
+        return self
+
+    def write(self, name: str, content: str) -> None:
+        """Parse and validate immediately (fail-fast), queue for persistence."""
+        doc = make_document(name, content)
+        self._kg._validate_doc(doc)
+        self._docs.append(doc)
+
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+        if exc_type is not None:
+            return  # user code raised — don't persist
+        if not self._docs:
+            return  # empty batch — no-op
+
+        # Deduplicate: last write wins for same node name
+        seen: dict[str, int] = {}
+        for i, doc in enumerate(self._docs):
+            seen[doc.name] = i
+        docs = [self._docs[i] for i in sorted(seen.values())]
+
+        kg = self._kg
+        kg._db.execute("BEGIN IMMEDIATE")
+        try:
+            # Record old types before any mutations for changelog
+            old_types: dict[str, str | None] = {}
+            for doc in docs:
+                old = kg._db.execute("SELECT type FROM nodes WHERE name = ?", (doc.name,)).fetchone()
+                old_types[doc.name] = old[0] if old else None
+
+            # Phase 1: Persist all documents (upsert data + update index)
+            for doc in docs:
+                meta_with_type = {**doc.meta, "type": doc.type}
+                old_type = old_types[doc.name]
+                type_changed = old_type is not None and old_type != doc.type
+
+                if type_changed:
+                    kg._delete_data_row(old_type, doc.name)
+
+                kg._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
+
+                kg._db.execute(
+                    "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+                    (doc.name, doc.type, slugify(doc.name)),
+                )
+
+                if doc.type != "kaybee":
+                    kg._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
+
+            # Phase 2: Sync links for all documents
+            for doc in docs:
+                kg._sync_links(doc.name, doc.body)
+
+            # Phase 3: Re-resolve backlinks for all written names
+            for doc in docs:
+                kg._re_resolve_links_to(doc.name)
+
+            # Phase 4: Log changelog entries
+            for doc in docs:
+                meta_with_type = {**doc.meta, "type": doc.type}
+                old_type = old_types[doc.name]
+                type_changed = old_type is not None and old_type != doc.type
+
+                if type_changed:
+                    kg._log("node.type_change", doc.name, {
+                        "old_type": old_type,
+                        "type": doc.type,
+                        "content": doc.body,
+                        "meta": meta_with_type,
+                    })
+                else:
+                    kg._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
+
+            kg._db.commit()
+        except BaseException:
+            kg._db.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
