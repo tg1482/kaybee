@@ -2,7 +2,7 @@
 
 import pytest
 
-from kaybee.core import KnowledgeGraph
+from kaybee.core import KnowledgeGraph, slugify
 
 
 class TestWikilinkExtraction:
@@ -202,3 +202,71 @@ class TestMvCpGraph:
         kg.cp("source", "copy")
         rows = kg.query("SELECT source_name FROM _links WHERE source_name = 'copy'")
         assert len(rows) == 1
+
+
+class TestSlugIndex:
+    def test_slug_populated_on_write(self, kg):
+        kg.write("hello-world", "content")
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'hello-world'")
+        assert rows[0][0] == "hello-world"
+
+    def test_slug_populated_on_touch(self, kg):
+        kg.touch("my-node")
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'my-node'")
+        assert rows[0][0] == "my-node"
+
+    def test_slug_populated_on_mv(self, kg):
+        kg.touch("old-name", "content")
+        kg.mv("old-name", "new-name")
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'new-name'")
+        assert rows[0][0] == "new-name"
+
+    def test_slug_populated_on_cp(self, kg):
+        kg.touch("original", "content")
+        kg.cp("original", "copy")
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'copy'")
+        assert rows[0][0] == "copy"
+
+    def test_resolve_uses_slug_index(self, kg):
+        kg.touch("agent-traversal", "content")
+        result = kg.resolve_wikilink("Agent Traversal", fuzzy=True)
+        assert result == "agent-traversal"
+
+    def test_migration_backfill(self, tmp_path):
+        """Simulate opening an old DB without slug column."""
+        import sqlite3
+        db_path = str(tmp_path / "test.db")
+        # Create a DB with old schema (no slug column)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                name TEXT PRIMARY KEY,
+                type TEXT NOT NULL DEFAULT 'kaybee'
+            );
+            CREATE TABLE IF NOT EXISTS _types (type_name TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS _links (
+                source_name TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                target_resolved TEXT,
+                context TEXT,
+                PRIMARY KEY (source_name, target_name)
+            );
+            CREATE TABLE IF NOT EXISTS _data (
+                name TEXT PRIMARY KEY,
+                content TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS _type_fields (
+                type_name TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                PRIMARY KEY (type_name, field_name)
+            );
+        """)
+        conn.execute("INSERT INTO nodes (name, type) VALUES ('existing-node', 'kaybee')")
+        conn.execute("INSERT INTO _data (name, content) VALUES ('existing-node', 'hello')")
+        conn.commit()
+        conn.close()
+        # Open with KnowledgeGraph — migration should backfill slug
+        kg = KnowledgeGraph(db_path)
+        rows = kg.query("SELECT slug FROM nodes WHERE name = 'existing-node'")
+        assert rows[0][0] == slugify("existing-node")

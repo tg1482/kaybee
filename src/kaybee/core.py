@@ -252,7 +252,8 @@ _RESERVED_TYPE_NAMES = frozenset({"nodes", "_types", "_links", "_changelog", "_d
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
     name    TEXT PRIMARY KEY,
-    type    TEXT NOT NULL DEFAULT 'kaybee'
+    type    TEXT NOT NULL DEFAULT 'kaybee',
+    slug    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
@@ -303,6 +304,7 @@ class KnowledgeGraph:
 
     def _init_schema(self) -> None:
         self._db.executescript(_SCHEMA_SQL)
+        self._migrate_slug_column()
         if self._changelog:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS _changelog ("
@@ -312,6 +314,17 @@ class KnowledgeGraph:
                 "name TEXT NOT NULL, "
                 "data TEXT)"
             )
+        self._db.commit()
+
+    def _migrate_slug_column(self) -> None:
+        """Add slug column to nodes table if missing and ensure index exists."""
+        cols = {row[1] for row in self._db.execute("PRAGMA table_info(nodes)").fetchall()}
+        if "slug" not in cols:
+            self._db.execute("ALTER TABLE nodes ADD COLUMN slug TEXT")
+            rows = self._db.execute("SELECT name FROM nodes").fetchall()
+            for (name,) in rows:
+                self._db.execute("UPDATE nodes SET slug = ? WHERE name = ?", (slugify(name), name))
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_slug ON nodes(slug)")
         self._db.commit()
 
     def _log(self, op: str, name: str, data: dict | None = None) -> None:
@@ -529,10 +542,10 @@ class KnowledgeGraph:
             # the nodes table pointing at a missing data row.
             self._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
 
-            # Thin index: name + type only
+            # Thin index: name + type + slug
             self._db.execute(
-                "INSERT OR REPLACE INTO nodes (name, type) VALUES (?, ?)",
-                (doc.name, doc.type),
+                "INSERT OR REPLACE INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+                (doc.name, doc.type, slugify(doc.name)),
             )
 
             # Auto-register typed nodes in _types (not kaybee)
@@ -643,8 +656,8 @@ class KnowledgeGraph:
             self._write_node(name, content)
         else:
             self._db.execute(
-                "INSERT OR IGNORE INTO nodes (name, type) VALUES (?, 'kaybee')",
-                (name,),
+                "INSERT OR IGNORE INTO nodes (name, type, slug) VALUES (?, 'kaybee', ?)",
+                (name, slugify(name)),
             )
             self._upsert_type_row("kaybee", name, "", {})
             self._log("node.write", name, {"type": "kaybee", "content": "", "meta": {}})
@@ -721,8 +734,8 @@ class KnowledgeGraph:
 
         # Insert new into index and type table
         self._db.execute(
-            "INSERT INTO nodes (name, type) VALUES (?, ?)",
-            (new_name, type_name),
+            "INSERT INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (new_name, type_name, slugify(new_name)),
         )
         # meta from _read_node_data includes 'type' for typed nodes; pass as-is
         self._upsert_type_row(type_name, new_name, content, meta)
@@ -754,8 +767,8 @@ class KnowledgeGraph:
         type_name = meta.get("type", "kaybee")
 
         self._db.execute(
-            "INSERT INTO nodes (name, type) VALUES (?, ?)",
-            (dst, type_name),
+            "INSERT INTO nodes (name, type, slug) VALUES (?, ?, ?)",
+            (dst, type_name, slugify(dst)),
         )
         self._upsert_type_row(type_name, dst, content, meta)
 
@@ -932,7 +945,7 @@ class KnowledgeGraph:
     def resolve_wikilink(self, name: str, fuzzy: bool = True) -> str | None:
         """Resolve a wikilink name to a node name.
 
-        Exact match first, then fuzzy via slugify.
+        Exact match first, then fuzzy via indexed slug lookup.
         """
         row = self._db.execute(
             "SELECT name FROM nodes WHERE name = ?", (name,)
@@ -943,12 +956,10 @@ class KnowledgeGraph:
         if not fuzzy:
             return None
 
-        target_slug = slugify(name)
-        rows = self._db.execute("SELECT name FROM nodes").fetchall()
-        for (rname,) in rows:
-            if slugify(rname) == target_slug:
-                return rname
-        return None
+        row = self._db.execute(
+            "SELECT name FROM nodes WHERE slug = ?", (slugify(name),)
+        ).fetchone()
+        return row[0] if row else None
 
     def backlinks(self, name: str) -> list[str]:
         rows = self._db.execute(
