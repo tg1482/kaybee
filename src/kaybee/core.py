@@ -495,61 +495,82 @@ class KnowledgeGraph:
             )
 
     # ------------------------------------------------------------------
-    # Internal: node write helper
+    # Internal: node write helpers (parse → validate → persist)
     # ------------------------------------------------------------------
 
-    def _write_node(self, name: str, content: str) -> None:
-        meta, body = parse_frontmatter(content)
-        effective_type = meta.get("type") or "kaybee"
+    def _validate_doc(self, doc: Document) -> None:
+        """Run structural validator if attached.
 
-        # Pre-write validator check (structural rules only)
-        if self._validator is not None:
-            from .constraints import ValidationError
-            violations = self._validator.validate_structural(name, meta)
-            if violations:
-                raise ValidationError(violations)
+        Reconstructs meta with ``type`` key for validator compatibility.
+        """
+        if self._validator is None:
+            return
+        from .constraints import ValidationError
+        meta_with_type = {**doc.meta, "type": doc.type}
+        violations = self._validator.validate_structural(doc.name, meta_with_type)
+        if violations:
+            raise ValidationError(violations)
+
+    def _persist_doc(self, doc: Document) -> None:
+        """Persist a validated Document inside a transaction."""
+        meta_with_type = {**doc.meta, "type": doc.type}
 
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (name,)).fetchone()
+            old = self._db.execute("SELECT type FROM nodes WHERE name = ?", (doc.name,)).fetchone()
             old_type = old[0] if old else None
-            type_changed = old_type is not None and old_type != effective_type
+            type_changed = old_type is not None and old_type != doc.type
 
             # Handle type change: delete from old type table
             if type_changed:
-                self._delete_data_row(old_type, name)
+                self._delete_data_row(old_type, doc.name)
 
             # Store data BEFORE updating the index so a crash never leaves
             # the nodes table pointing at a missing data row.
-            self._upsert_type_row(effective_type, name, body, meta)
+            self._upsert_type_row(doc.type, doc.name, doc.body, meta_with_type)
 
             # Thin index: name + type only
             self._db.execute(
                 "INSERT OR REPLACE INTO nodes (name, type) VALUES (?, ?)",
-                (name, effective_type),
+                (doc.name, doc.type),
             )
 
             # Auto-register typed nodes in _types (not kaybee)
-            if effective_type != "kaybee":
-                self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (effective_type,))
+            if doc.type != "kaybee":
+                self._db.execute("INSERT OR IGNORE INTO _types (type_name) VALUES (?)", (doc.type,))
 
-            self._sync_links(name, body)
-            self._re_resolve_links_to(name)
+            self._sync_links(doc.name, doc.body)
+            self._re_resolve_links_to(doc.name)
 
             if type_changed:
-                self._log("node.type_change", name, {
+                self._log("node.type_change", doc.name, {
                     "old_type": old_type,
-                    "type": effective_type,
-                    "content": body,
-                    "meta": meta,
+                    "type": doc.type,
+                    "content": doc.body,
+                    "meta": meta_with_type,
                 })
             else:
-                self._log("node.write", name, {"type": effective_type, "content": body, "meta": meta})
+                self._log("node.write", doc.name, {"type": doc.type, "content": doc.body, "meta": meta_with_type})
 
             self._db.commit()
         except BaseException:
             self._db.rollback()
             raise
+
+    def _write_node(self, name: str, content: str) -> None:
+        doc = make_document(name, content)
+        self._validate_doc(doc)
+        self._persist_doc(doc)
+
+    def dry_write(self, name: str, content: str) -> Document:
+        """Parse and validate without persisting.
+
+        Returns the :class:`Document` that *would* be written.
+        Raises :class:`~kaybee.constraints.ValidationError` on failure.
+        """
+        doc = make_document(name, content)
+        self._validate_doc(doc)
+        return doc
 
     # ------------------------------------------------------------------
     # Type management

@@ -1,8 +1,8 @@
-"""Tests for Document dataclass and make_document() factory."""
+"""Tests for Document dataclass, make_document() factory, and write pipeline."""
 
 import pytest
 
-from kaybee.core import Document, make_document, slugify
+from kaybee.core import Document, KnowledgeGraph, make_document, slugify
 
 
 class TestDocumentConstruction:
@@ -137,3 +137,79 @@ class TestMakeDocumentEdgeCases:
         assert doc.meta["born"] == "1912"
         assert doc.meta["tags"] == ["ai", "math"]
         assert doc.body == "Bio here."
+
+
+class TestPipelineEquivalence:
+    """Verify the refactored pipeline produces the same results as the old monolithic write."""
+
+    def test_write_produces_same_cat(self):
+        kg = KnowledgeGraph()
+        kg.write("node", "---\ntype: concept\ntags: [a]\n---\nBody text.")
+        content = kg.cat("node")
+        assert "Body text." in content
+        assert "concept" in content
+
+    def test_write_type_registered(self):
+        kg = KnowledgeGraph()
+        kg.write("x", "---\ntype: concept\n---\nContent.")
+        assert "concept" in kg.types()
+
+    def test_write_links_synced(self):
+        kg = KnowledgeGraph()
+        kg.write("target", "I exist.")
+        kg.write("source", "See [[target]].")
+        links = kg.links("source")
+        assert any(resolved == "target" for _, resolved in links)
+
+    def test_write_changelog_logged(self):
+        kg = KnowledgeGraph(changelog=True)
+        kg.write("x", "content")
+        entries = kg.changelog()
+        ops = [e[2] for e in entries]
+        assert "node.write" in ops
+
+    def test_write_type_change_logged(self):
+        kg = KnowledgeGraph(changelog=True)
+        kg.write("x", "---\ntype: concept\n---\nA.")
+        kg.write("x", "---\ntype: person\n---\nB.")
+        entries = kg.changelog()
+        ops = [e[2] for e in entries]
+        assert "node.type_change" in ops
+
+
+class TestDryWrite:
+    def test_returns_document(self):
+        kg = KnowledgeGraph()
+        doc = kg.dry_write("node", "---\ntype: concept\n---\nBody.")
+        assert isinstance(doc, Document)
+        assert doc.type == "concept"
+        assert doc.body == "Body."
+
+    def test_does_not_persist(self):
+        kg = KnowledgeGraph()
+        kg.dry_write("ghost", "content")
+        assert not kg.exists("ghost")
+
+    def test_does_not_log_changelog(self):
+        kg = KnowledgeGraph(changelog=True)
+        kg.dry_write("ghost", "content")
+        assert kg.changelog() == []
+
+    def test_raises_on_validation_failure(self):
+        from kaybee.constraints import Validator, ValidationError, requires_field
+        kg = KnowledgeGraph()
+        v = Validator()
+        v.add(requires_field("concept", "description"))
+        kg.set_validator(v)
+        with pytest.raises(ValidationError):
+            kg.dry_write("x", "---\ntype: concept\n---\nNo description field.")
+
+    def test_passes_validation(self):
+        from kaybee.constraints import Validator, requires_field
+        kg = KnowledgeGraph()
+        v = Validator()
+        v.add(requires_field("concept", "description"))
+        kg.set_validator(v)
+        doc = kg.dry_write("x", "---\ntype: concept\ndescription: ok\n---\nBody.")
+        assert doc.type == "concept"
+        assert not kg.exists("x")
