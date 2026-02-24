@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -52,6 +53,39 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 def extract_wikilinks(text: str) -> list[str]:
     """Extract all ``[[wikilink]]`` targets from *text*."""
     return _WIKILINK_RE.findall(text)
+
+
+@dataclass
+class Document:
+    """Structured intermediate representation of a parsed node."""
+
+    name: str
+    type: str
+    meta: dict = field(default_factory=dict)
+    body: str = ""
+    raw: str = ""
+    refs: list[str] = field(default_factory=list)
+
+
+def make_document(name: str, text: str) -> Document:
+    """Parse *text* into a :class:`Document`.
+
+    This is a pure function that combines ``slugify``, ``parse_frontmatter``,
+    and ``extract_wikilinks`` into a single step, producing a structured
+    intermediate representation suitable for validation and persistence.
+    """
+    slug_name = slugify(name)
+    meta, body = parse_frontmatter(text)
+    effective_type = meta.pop("type", None) or "kaybee"
+    refs = extract_wikilinks(body)
+    return Document(
+        name=slug_name,
+        type=effective_type,
+        meta=meta,
+        body=body,
+        raw=text,
+        refs=refs,
+    )
 
 
 def _parse_yaml_subset(yaml_str: str) -> dict[str, Any]:
